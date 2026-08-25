@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "growearn_db"
     DATABASE_URL: Optional[str] = None
 
+    # Gemini AI & Multimodal Embedding Configuration
+    GEMINI_API_KEY: Optional[str] = None
+    EMBEDDING_MODEL: str = "gemini-embedding-2"
+    EMBEDDING_DIMENSION: int = 1536
+    GEMINI_INTENT_MODEL: str = "gemini-3.6-flash"
+
     @property
     def sync_database_url(self) -> str:
         """Returns the active database URL or constructs one from components."""

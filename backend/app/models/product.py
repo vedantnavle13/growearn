@@ -39,6 +39,10 @@ class Product(Base):
     # Embedding vector prepared for AI product retrieval & semantic search (1536 dimensions for standard OpenAI / embedding models)
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(1536), nullable=True)
     
+    # Image multimodal columns (Gemini Embedding 2: 1536 dimensions)
+    image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    image_embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(1536), nullable=True)
+    
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

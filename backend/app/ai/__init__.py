@@ -1,1 +1,3 @@
-"""AI agent, intent extraction, retrieval, and ranking modules package."""
+from app.ai.embeddings import EmbeddingService, get_embedding_service
+
+__all__ = ["EmbeddingService", "get_embedding_service"]

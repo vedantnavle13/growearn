@@ -1,11 +1,10 @@
 import sys
 from pathlib import Path
 
-
-
 from fastapi import FastAPI
 from app.core.config import settings
 from app.api.health import router as health_router
+from app.api.products import router as products_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -15,7 +14,6 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Register health check routes
+# Register routers
 app.include_router(health_router)
-
-
+app.include_router(products_router)
