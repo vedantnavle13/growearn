@@ -1,5 +1,5 @@
 """
-Unit tests for the modular Retrieval Layer (TextRetriever, ImageRetriever, HybridRetriever, and ProductFilters).
+Unit tests for the modular Retrieval Layer (TextRetriever, ImageRetriever, HybridRetriever, and ProductFilters) with tenant isolation.
 """
 
 import uuid
@@ -53,8 +53,26 @@ class TestProductFilters:
             in_stock=True,
         )
         clauses = filters.to_sqlalchemy_clauses()
-        # is_active, category, min_price, max_price, color, size subq, in_stock subq = 7 clauses
-        assert len(clauses) == 7
+        # is_active + category + single combined variant EXISTS subquery = 3 clauses
+        assert len(clauses) == 3
+
+    def test_category_only_gives_two_clauses(self):
+        """Category filter is product-level, so no variant subquery needed."""
+        filters = ProductFilters(category="Shoes")
+        clauses = filters.to_sqlalchemy_clauses()
+        assert len(clauses) == 2  # is_active + category
+
+    def test_price_only_gives_two_clauses(self):
+        """Price filter triggers a variant EXISTS subquery."""
+        filters = ProductFilters(max_price=Decimal("2500"))
+        clauses = filters.to_sqlalchemy_clauses()
+        assert len(clauses) == 2  # is_active + variant EXISTS
+
+    def test_color_only_gives_two_clauses(self):
+        """Color filter triggers a variant EXISTS subquery."""
+        filters = ProductFilters(color="black")
+        clauses = filters.to_sqlalchemy_clauses()
+        assert len(clauses) == 2  # is_active + variant EXISTS
 
     def test_filters_immutability(self):
         filters = ProductFilters(category="Shoes")
@@ -78,11 +96,18 @@ class TestTextRetriever:
             embedding_service=mock_embedding_svc,
         )
 
+        test_merchant_id = uuid.uuid4()
         filters = ProductFilters(category="Shirts")
-        results = retriever.retrieve(query="denim shirt", filters=filters, limit=5)
+        results = retriever.retrieve(
+            merchant_id=test_merchant_id,
+            query="denim shirt",
+            filters=filters,
+            limit=5,
+        )
 
         mock_embedding_svc.embed_text.assert_called_once_with("denim shirt")
         mock_repo.vector_search.assert_called_once_with(
+            merchant_id=test_merchant_id,
             query_vector=dummy_vector,
             filters=filters,
             limit=5,
@@ -97,21 +122,23 @@ class TestTextRetriever:
 class TestStubs:
     def test_image_retriever_stub_raises_not_implemented(self):
         retriever = ImageRetriever()
+        test_merchant_id = uuid.uuid4()
         with pytest.raises(NotImplementedError) as exc_info:
-            retriever.retrieve(query=b"fake_image_bytes")
+            retriever.retrieve(merchant_id=test_merchant_id, query=b"fake_image_bytes")
         assert "multimodal step" in str(exc_info.value)
 
         with pytest.raises(NotImplementedError) as exc_info2:
-            retriever.retrieve_by_url(image_url="https://example.com/img.jpg")
+            retriever.retrieve_by_url(merchant_id=test_merchant_id, image_url="https://example.com/img.jpg")
         assert "multimodal step" in str(exc_info2.value)
 
     def test_hybrid_retriever_stub_raises_not_implemented(self):
         mock_repo = MagicMock()
         text_retriever = TextRetriever(repository=mock_repo)
         hybrid = HybridRetriever(text_retriever=text_retriever)
+        test_merchant_id = uuid.uuid4()
 
         with pytest.raises(NotImplementedError) as exc_info:
-            hybrid.retrieve(query="shoes", image_data=b"fake_bytes")
+            hybrid.retrieve(merchant_id=test_merchant_id, query="shoes", image_data=b"fake_bytes")
         assert "multi-modal" in str(exc_info.value)
 
 
@@ -128,7 +155,9 @@ class TestProductServiceOrchestration:
             text_retriever=mock_text_retriever,
         )
 
+        test_merchant_id = uuid.uuid4()
         response = service.semantic_search_products(
+            merchant_id=test_merchant_id,
             q="linen shirt",
             category="Shirts",
             min_price=Decimal("1500"),
@@ -140,9 +169,10 @@ class TestProductServiceOrchestration:
         assert response.results[0].title == "Oxford Linen Shirt"
         assert response.results[0].similarity_score == 0.8850
 
-        # Verify TextRetriever was called with proper ProductFilters
+        # Verify TextRetriever was called with proper merchant_id and ProductFilters
         mock_text_retriever.retrieve.assert_called_once()
         call_kwargs = mock_text_retriever.retrieve.call_args[1]
+        assert call_kwargs["merchant_id"] == test_merchant_id
         assert call_kwargs["query"] == "linen shirt"
         assert call_kwargs["limit"] == 5
         assert isinstance(call_kwargs["filters"], ProductFilters)

@@ -1,14 +1,16 @@
 """
-Product Repository: all database access for product search.
+Product Repository: all database access for product search with strict tenant isolation.
 
 Rules:
 - Only this module may issue SQLAlchemy queries for products.
+- Every query MUST enforce `Product.merchant_id == merchant_id` at the SQL level.
 - Never accept raw strings to inject into SQL; always use ORM operators
   or SQLAlchemy's parameterized bind values.
 - Never expose cost_price in returned data (callers receive ORM objects,
   but the service layer is responsible for shaping the response schema).
 """
 
+import uuid
 from decimal import Decimal
 from typing import Optional, List, Tuple
 
@@ -20,7 +22,7 @@ from app.retrieval.filters import ProductFilters
 
 
 class ProductRepository:
-    """Data-access layer for products, variants, and inventory."""
+    """Data-access layer for products, variants, and inventory with tenant isolation."""
 
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -28,6 +30,7 @@ class ProductRepository:
     def search(
         self,
         *,
+        merchant_id: uuid.UUID,
         q: Optional[str] = None,
         filters: Optional[ProductFilters] = None,
         category: Optional[str] = None,
@@ -39,7 +42,7 @@ class ProductRepository:
         limit: int = 20,
     ) -> Tuple[List[Product], int]:
         """
-        Query products that match keyword search and deterministic filters.
+        Query products scoped to merchant_id that match keyword search and deterministic filters.
         Returns a tuple of (list[Product], total_count).
         """
         if filters is None:
@@ -52,7 +55,9 @@ class ProductRepository:
                 in_stock=in_stock,
             )
 
-        clauses = filters.to_sqlalchemy_clauses()
+        # Base tenant isolation constraint + filters
+        clauses = [Product.merchant_id == merchant_id]
+        clauses.extend(filters.to_sqlalchemy_clauses())
 
         # Keyword search: ILIKE over title and description
         if q and q.strip():
@@ -85,15 +90,18 @@ class ProductRepository:
     def vector_search(
         self,
         *,
+        merchant_id: uuid.UUID,
         query_vector: List[float],
         filters: Optional[ProductFilters] = None,
         limit: int = 10,
     ) -> List[Tuple[Product, float]]:
         """
-        Execute pgvector cosine distance search against Product.embedding with optional filters.
+        Execute pgvector cosine distance search against Product.embedding scoped to merchant_id.
+        Hard tenant boundary is enforced in SQL WHERE BEFORE pgvector distance calculation and ranking.
         Returns a list of (Product, similarity_score) tuples ordered by highest similarity.
         """
         clauses = [
+            Product.merchant_id == merchant_id,
             Product.is_active.is_(True),
             Product.embedding.is_not(None),
         ]
@@ -130,6 +138,7 @@ class ProductRepository:
     def semantic_search(
         self,
         *,
+        merchant_id: uuid.UUID,
         query_vector: List[float],
         category: Optional[str] = None,
         min_price: Optional[Decimal] = None,
@@ -140,7 +149,7 @@ class ProductRepository:
         limit: int = 10,
     ) -> List[Tuple[Product, float]]:
         """
-        Backward-compatible wrapper around vector_search.
+        Backward-compatible wrapper around vector_search scoped to merchant_id.
         """
         filters = ProductFilters(
             category=category,
@@ -151,6 +160,7 @@ class ProductRepository:
             in_stock=in_stock,
         )
         return self.vector_search(
+            merchant_id=merchant_id,
             query_vector=query_vector,
             filters=filters,
             limit=limit,

@@ -1,17 +1,18 @@
 """
 Hybrid Retriever (Interface / Stub).
 
-Defines the contract for future multi-modal hybrid retrieval (Text + Image + Filters).
+Defines the contract for future multi-modal hybrid retrieval (Text + Image + Filters) with merchant isolation.
 
 Planned Future Workflow:
-1. Concurrently query TextRetriever and ImageRetriever.
+1. Concurrently query TextRetriever and ImageRetriever for merchant_id.
 2. Combine and normalize similarity scores using Reciprocal Rank Fusion (RRF)
    or weighted score blending:
    score = (w_text * text_score) + (w_image * image_score).
 3. Apply deterministic business filters.
-4. Return fused candidate product rankings.
+4. Return fused candidate product rankings within merchant_id boundary.
 """
 
+import uuid
 from typing import Optional, List, Tuple, Any
 
 from app.models.product import Product
@@ -41,6 +42,8 @@ class HybridRetriever:
 
     def retrieve(
         self,
+        *,
+        merchant_id: uuid.UUID,
         query: Any = None,
         filters: Optional[ProductFilters] = None,
         limit: int = 10,
@@ -48,7 +51,7 @@ class HybridRetriever:
         image_url: Optional[str] = None,
     ) -> List[Tuple[Product, float]]:
         """
-        Execute multi-modal hybrid retrieval.
+        Execute multi-modal hybrid retrieval scoped to merchant_id.
         """
         raise NotImplementedError(
             "HybridRetriever.retrieve() is a staged architecture stub and will be implemented when multi-modal search is activated."

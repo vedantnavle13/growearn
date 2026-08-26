@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
-from sqlalchemy import String, ForeignKey, DateTime, func
+from sqlalchemy import String, ForeignKey, DateTime, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,9 @@ if TYPE_CHECKING:
 
 class Customer(Base):
     __tablename__ = "customers"
+    __table_args__ = (
+        UniqueConstraint("merchant_id", "external_customer_id", name="uq_customers_merchant_external_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -30,6 +33,7 @@ class Customer(Base):
         nullable=False,
         index=True
     )
+    external_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)

@@ -81,3 +81,61 @@ class CommerceIntent(BaseModel):
                     f"min_price ({self.min_price}) must be less than or equal to max_price ({self.max_price})"
                 )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Request / Response schemas for intent endpoints
+# ---------------------------------------------------------------------------
+
+class IntentParseRequest(BaseModel):
+    """Request body for POST /api/intent/parse."""
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Natural language user query to extract intent from",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def validate_query_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Query must not be empty or whitespace only")
+        return v.strip()
+
+
+import uuid
+
+
+class IntentSearchRequest(BaseModel):
+    """Request body for POST /api/products/search/intent."""
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Natural language user query for intent-driven product search",
+    )
+    customer_id: Optional[uuid.UUID] = Field(
+        default=None,
+        description="Optional customer ID to apply lightweight customer personalization signals",
+    )
+    external_customer_id: Optional[str] = Field(
+        default=None,
+        description="Optional external customer ID from merchant system for customer personalization",
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of results (default 10, max 50)",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def validate_query_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Query must not be empty or whitespace only")
+        return v.strip()
+

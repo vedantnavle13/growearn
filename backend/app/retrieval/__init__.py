@@ -10,6 +10,14 @@ from app.retrieval.filters import ProductFilters
 from app.retrieval.text_retriever import TextRetriever
 from app.retrieval.image_retriever import ImageRetriever
 from app.retrieval.hybrid_retriever import HybridRetriever
+from app.retrieval.ranker import (
+    ProductRanker,
+    ScoredProduct,
+    SEMANTIC_WEIGHT,
+    KEYWORD_WEIGHT,
+    ATTRIBUTE_WEIGHT,
+    PERSONALIZATION_WEIGHT,
+)
 
 __all__ = [
     "Retriever",
@@ -17,4 +25,10 @@ __all__ = [
     "TextRetriever",
     "ImageRetriever",
     "HybridRetriever",
+    "ProductRanker",
+    "ScoredProduct",
+    "SEMANTIC_WEIGHT",
+    "KEYWORD_WEIGHT",
+    "ATTRIBUTE_WEIGHT",
+    "PERSONALIZATION_WEIGHT",
 ]

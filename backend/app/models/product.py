@@ -2,7 +2,7 @@ import uuid
 from decimal import Decimal
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
-from sqlalchemy import String, Text, Numeric, Integer, Boolean, ForeignKey, DateTime, func
+from sqlalchemy import String, Text, Numeric, Integer, Boolean, ForeignKey, DateTime, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
@@ -17,6 +17,9 @@ if TYPE_CHECKING:
 
 class Product(Base):
     __tablename__ = "products"
+    __table_args__ = (
+        UniqueConstraint("merchant_id", "external_product_id", name="uq_products_merchant_external_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -30,6 +33,7 @@ class Product(Base):
         nullable=False,
         index=True
     )
+    external_product_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -80,6 +84,7 @@ class ProductVariant(Base):
         nullable=False,
         index=True
     )
+    external_variant_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     sku: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     size: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     color: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)

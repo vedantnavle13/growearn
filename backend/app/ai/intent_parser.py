@@ -5,7 +5,9 @@ Supports ANY ecommerce category (clothing, electronics, stationery, watches, boo
 """
 
 import os
+import re
 import json
+import time
 from typing import Optional
 from google import genai
 from google.genai import types
@@ -81,23 +83,51 @@ class IntentParser:
         if not text or not isinstance(text, str) or not text.strip():
             raise ValueError("Input text for intent parsing must be a non-empty string.")
 
+        import time
+
         user_prompt = f"Customer request: {text.strip()}"
+        max_retries = 4
+        last_exc = None
 
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                temperature=0.0,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            )
+        candidate_models = [self.model, "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+        candidate_models = list(dict.fromkeys(candidate_models))
 
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=user_prompt,
-                config=config,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Gemini intent extraction call failed: {exc}") from exc
+        for model_name in candidate_models:
+            for attempt in range(max_retries):
+                try:
+                    config = types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    )
+
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=user_prompt,
+                        config=config,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc)
+                    if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str):
+                        # Switch to fallback model immediately
+                        if model_name != candidate_models[-1]:
+                            break
+                        if attempt < max_retries - 1:
+                            delay_match = re.search(r'retry in (\d+(?:\.\d+)?)s', err_str)
+                            wait_sec = float(delay_match.group(1)) + 1.5 if delay_match else (5.0 * (attempt + 1))
+                            time.sleep(wait_sec)
+                            continue
+                    raise RuntimeError(f"Gemini intent extraction call failed: {exc}") from exc
+
+            if last_exc is None:
+                break
+
+        if last_exc:
+            raise RuntimeError(f"Gemini intent extraction call failed: {last_exc}") from last_exc
 
         if not response or not response.text:
             raise RuntimeError("Gemini model returned an empty response.")

@@ -1,15 +1,16 @@
 """
 Image Retriever (Interface / Stub).
 
-Defines the contract for future image-based visual product retrieval.
+Defines the contract for future image-based visual product retrieval with merchant isolation.
 
 Planned Future Workflow:
-1. Accept image bytes or public image URL.
+1. Accept merchant_id and image bytes or public image URL.
 2. Generate 1536-dimensional image embedding via Gemini Multimodal Embedding model.
-3. Query pgvector cosine distance on `Product.image_embedding`.
+3. Query pgvector cosine distance on `Product.image_embedding` scoped to merchant_id.
 4. Return candidate products with visual similarity scores.
 """
 
+import uuid
 from typing import Optional, List, Tuple, Any, TYPE_CHECKING
 
 from app.models.product import Product
@@ -31,12 +32,14 @@ class ImageRetriever:
 
     def retrieve(
         self,
+        *,
+        merchant_id: uuid.UUID,
         query: Any,
         filters: Optional[ProductFilters] = None,
         limit: int = 10,
     ) -> List[Tuple[Product, float]]:
         """
-        Retrieve products by visual similarity from image data or image URL.
+        Retrieve products by visual similarity from image data or image URL scoped to merchant_id.
         """
         raise NotImplementedError(
             "ImageRetriever.retrieve() is a staged architecture stub and will be implemented in the multimodal step."
@@ -44,12 +47,14 @@ class ImageRetriever:
 
     def retrieve_by_url(
         self,
+        *,
+        merchant_id: uuid.UUID,
         image_url: str,
         filters: Optional[ProductFilters] = None,
         limit: int = 10,
     ) -> List[Tuple[Product, float]]:
         """
-        Retrieve products by visual similarity from an image URL.
+        Retrieve products by visual similarity from an image URL scoped to merchant_id.
         """
         raise NotImplementedError(
             "ImageRetriever.retrieve_by_url() is a staged architecture stub and will be implemented in the multimodal step."

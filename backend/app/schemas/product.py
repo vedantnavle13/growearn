@@ -136,3 +136,35 @@ class SemanticSearchParams(BaseModel):
             raise ValueError("max_price must be greater than or equal to min_price")
         return v
 
+
+# ---------------------------------------------------------------------------
+# Intent-based search schemas
+# ---------------------------------------------------------------------------
+
+class IntentSearchResult(BaseModel):
+    """Product result from intent-driven search with similarity score.
+
+    cost_price and raw embedding vectors are never exposed.
+    """
+
+    id: uuid.UUID
+    title: str
+    description: Optional[str] = None
+    price: Decimal
+    attributes: dict
+    variants: list[VariantSummary] = Field(default_factory=list)
+    similarity_score: float = Field(..., description="Cosine similarity score (0.0 to 1.0)")
+
+    model_config = {"from_attributes": True}
+
+
+class IntentSearchResponse(BaseModel):
+    """Response for POST /api/products/search/intent."""
+
+    query: str = Field(..., description="Original user query")
+    intent: dict = Field(..., description="Extracted CommerceIntent")
+    total: int
+    limit: int
+    results: list[IntentSearchResult]
+
+
