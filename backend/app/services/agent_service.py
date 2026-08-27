@@ -9,19 +9,25 @@ Responsibilities:
 - Never exposes internal implementation details to the LLM
 """
 
+import os
 import json
+import logging
 import uuid
 from decimal import Decimal
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 
 from google import genai
 from google.genai import types
+from huggingface_hub import InferenceClient
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 from app.core.merchant_context import MerchantContext
 from app.models.agent_session import AgentSession
 from app.models.cart import Cart, CartItem
+from app.models.enums import CartStatus
 from app.models.customer import Customer
 from app.models.product import Product, ProductVariant
 from app.schemas.agent import (
@@ -124,12 +130,271 @@ ADD_TO_CART_TOOL = types.FunctionDeclaration(
     ),
 )
 
+CHECKOUT_SINGLE_PRODUCT_TOOL = types.FunctionDeclaration(
+    name="checkout_single_product",
+    description=(
+        "Initiate checkout for a SPECIFIC product from the last search results. "
+        "Use when user says 'buy the first one', 'proceed payment of 1st product', "
+        "'buy product number 2', 'purchase the third one', 'pay for the second shirt', etc. "
+        "These refer to the CURRENT SESSION'S LAST SEARCH RESULTS by position. "
+        "NEVER use this for 'checkout my cart' or 'checkout everything' — use checkout_cart instead."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "reference_position": types.Schema(
+                type=types.Type.INTEGER,
+                minimum=1,
+                maximum=50,
+                description="1-based position in last search results. Use for 'first', 'second', '1st', '2nd', etc."
+            ),
+            "product_id": types.Schema(
+                type=types.Type.STRING,
+                description="Explicit product UUID (alternative to reference_position, only use if user provided exact UUID)"
+            ),
+            "quantity": types.Schema(
+                type=types.Type.INTEGER,
+                minimum=1,
+                maximum=99,
+                description="Quantity to purchase. Extract from 'buy 2 of the first' → quantity=2. Default is 1."
+            ),
+            "size": types.Schema(
+                type=types.Type.STRING,
+                description="Size if user specified: 'L', 'M', 'XL', etc. Leave null if user did not specify."
+            ),
+            "address_hint": types.Schema(
+                type=types.Type.STRING,
+                description="Address reference if user specified: 'default', 'home', 'office', '2'. Null if not mentioned."
+            ),
+        },
+        required=[],
+    ),
+)
+
+CHECKOUT_CART_TOOL = types.FunctionDeclaration(
+    name="checkout_cart",
+    description=(
+        "Initiate checkout for the customer's ENTIRE ACTIVE CART. "
+        "Use when user says 'checkout my cart', 'proceed with my cart', 'pay for my cart', "
+        "'checkout everything', 'buy everything in my cart', or plain 'checkout' with no product reference."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "address_hint": types.Schema(
+                type=types.Type.STRING,
+                description="Address reference if user specified: 'default', 'home', 'office', '2'. Null if not mentioned."
+            ),
+        },
+        required=[],
+    ),
+)
+
+CONFIRM_CHECKOUT_TOOL = types.FunctionDeclaration(
+    name="confirm_checkout",
+    description=(
+        "Called ONLY when the user explicitly confirms a pending checkout. "
+        "The checkout summary has already been shown. The user has said 'yes', 'proceed', 'confirm', etc. "
+        "This creates the order record."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "confirm": types.Schema(
+                type=types.Type.BOOLEAN,
+                description="Must be true. User confirmed they want to proceed."
+            ),
+        },
+        required=["confirm"],
+    ),
+)
+
 AGENT_TOOLS = types.Tool(function_declarations=[
     SEARCH_PRODUCTS_TOOL,
     GET_PRODUCT_TOOL,
     GET_CART_TOOL,
     ADD_TO_CART_TOOL,
+    CHECKOUT_SINGLE_PRODUCT_TOOL,
+    CHECKOUT_CART_TOOL,
+    CONFIRM_CHECKOUT_TOOL,
 ])
+
+# ---------------------------------------------------------------------------
+# Tool Function Declarations for Hugging Face / OpenAI Schema
+# ---------------------------------------------------------------------------
+
+HF_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_products",
+            "description": "Search for products using natural language query. Returns a list of products with position indices for follow-up references.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query (e.g., 'black formal shirt under 2500')",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 10, max 50). Use when user specifies a count like 'top 5' or 'show me 3'.",
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product",
+            "description": "Get detailed information about a specific product by ID. Use when user asks for details about a product from search results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "description": "Product UUID from search results",
+                    },
+                },
+                "required": ["product_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cart",
+            "description": "Get the current customer's cart contents with items, quantities, prices, and totals.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_cart",
+            "description": "Add a product variant to the customer's cart using a position reference from the most recent search results. Use this when user says 'add the first one', 'add second product', etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference_position": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Position in the most recent search results (1-based). Use this for 'add the first one', 'add second product', etc.",
+                    },
+                    "product_id": {
+                        "type": "string",
+                        "description": "Product UUID (alternative to reference_position, use when you have the ID from get_product)",
+                    },
+                    "variant_id": {
+                        "type": "string",
+                        "description": "Product variant UUID (required if using product_id)",
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 99,
+                        "default": 1,
+                        "description": "Quantity to add",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "checkout_single_product",
+            "description": (
+                "Initiate checkout for a SPECIFIC product from the last search results. "
+                "Use when user says 'buy the first one', 'proceed payment of 1st product', "
+                "'buy product number 2', 'purchase the third one', etc. "
+                "These refer to the CURRENT SESSION'S LAST SEARCH RESULTS by position. "
+                "NEVER use this for 'checkout my cart' or 'checkout everything'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference_position": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "1-based position in last search results. Use for 'first', 'second', '1st', '2nd', etc.",
+                    },
+                    "product_id": {
+                        "type": "string",
+                        "description": "Explicit product UUID (only if user provided exact UUID)",
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 99,
+                        "default": 1,
+                        "description": "Quantity. Extract from 'buy 2 of the first' → quantity=2.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Size if user specified: 'L', 'M', 'XL'. Null if not specified.",
+                    },
+                    "address_hint": {
+                        "type": "string",
+                        "description": "Address reference: 'default', 'home', 'office', '2'. Null if not mentioned.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "checkout_cart",
+            "description": (
+                "Initiate checkout for the customer's ENTIRE ACTIVE CART. "
+                "Use when user says 'checkout my cart', 'proceed with my cart', 'pay for my cart', "
+                "'checkout everything', 'buy everything in my cart', or plain 'checkout' with no product reference."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "address_hint": {
+                        "type": "string",
+                        "description": "Address reference: 'default', 'home', 'office', '2'. Null if not mentioned.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_checkout",
+            "description": (
+                "Called ONLY when the user explicitly confirms a pending checkout. "
+                "The checkout summary has already been shown. User said 'yes', 'proceed', 'confirm', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true. User confirmed they want to proceed.",
+                    },
+                },
+                "required": ["confirm"],
+            },
+        },
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -143,42 +408,124 @@ Your capabilities:
 2. Get detailed product information
 3. View the customer's cart
 4. Add products to the cart
+5. Checkout a specific search result product (checkout_single_product)
+6. Checkout the entire cart (checkout_cart)
 
-Rules:
+Core Rules:
 - Be concise and helpful
-- Use the tools provided - do NOT invent product information, prices, or stock
+- Use the tools provided — do NOT invent product information, prices, IDs, or stock
 - When user refers to "the second one" or "first product", use the position from the most recent search results
-- Do not ask for product IDs - use the search results stored in your context
+- Do not ask for product IDs — use search result positions
 - If a tool fails, explain the actual reason to the user
 - Do not mention internal implementation, embeddings, database queries, or system internals
 - If user asks unrelated questions, respond naturally without calling product tools
 
-When showing search results, the system will provide position numbers (1, 2, 3...). Use these for follow-ups.
-
-CRITICAL: Adding to cart uses the reference_position parameter:
+===== ADD TO CART =====
 
 For "add the second one to cart", "add first product", "add #1", "put the first shirt in my cart":
-1. Look at the LAST SEARCH RESULTS in the context above. Find the position number (e.g., position 1 for "first", 2 for "second").
-2. Call add_to_cart with reference_position=<that position number> and quantity (default 1).
-3. The system will automatically resolve the actual product_id and variant_id from that position.
-4. If the user specifies a variant like "add the second one in Large", call get_product first with the product_id from that position, then call add_to_cart with the specific variant_id.
-5. If user specifies quantity like "add 2 of the second one", use quantity=2. Default is 1.
+1. Call add_to_cart with reference_position=<that position number> and quantity (default 1)
+2. The system resolves the actual product_id and variant_id from that position
+3. If user specifies a variant like "add the second one in Large":
+   - Call get_product first with the product_id from that position
+   - Find the Large variant, call add_to_cart with specific variant_id
+4. If user specifies quantity "add 2 of the second one", use quantity=2. Default is 1.
+5. NEVER invent product_id values like "1" or "first" — positions are integers, IDs are UUIDs.
 
-Example flow for "add the second one to cart":
-- Context shows: "2. Black Shirt - 1999 black M (in stock) (variant_id: abc-123)"
-- Call add_to_cart(reference_position=2, quantity=1)
+===== PURCHASE / CHECKOUT — THREE DISTINCT MODES =====
 
-Example flow for "add 3 of the first one":
-- Context shows: "1. Blue Jeans - 2999 blue 32 (in stock) (variant_id: xyz-789)"
-- Call add_to_cart(reference_position=1, quantity=3)
+MODE 1 — SINGLE PRODUCT CHECKOUT (checkout_single_product):
 
-Example flow for "add the second one in Large":
-- Context shows position 2 has product_id="xyz-789"
-- Call get_product(product_id="xyz-789") to see all variants
-- Find the Large variant, note its variant_id
-- Call add_to_cart(product_id="xyz-789", variant_id="<large_variant_id>", quantity=1)
+Use when user says:
+  "buy the first one"
+  "proceed payment of 1st product"
+  "checkout the first product"
+  "purchase the second shirt"
+  "buy product number 3"
+  "pay for the first one"
+  "I want the 2nd one"
 
-The search results context includes variant_id for the primary variant shown. Use reference_position for unambiguous add-to-cart from search results.
+These ALWAYS refer to the LAST SEARCH RESULTS by position number.
+Call: checkout_single_product(reference_position=<N>, quantity=<qty>, size=<size if mentioned>, address_hint=<hint if mentioned>)
+
+CRITICAL: Do NOT call get_cart or checkout_cart for single-product purchases.
+The backend will resolve position → actual product UUID. Do NOT invent UUIDs.
+
+Examples:
+  "proceed payment of 1st product"
+    → checkout_single_product(reference_position=1)
+
+  "buy 2 of the first one"
+    → checkout_single_product(reference_position=1, quantity=2)
+
+  "buy first shirt in Large"
+    → checkout_single_product(reference_position=1, size="L")
+
+  "buy first product and use my default address"
+    → checkout_single_product(reference_position=1, address_hint="default")
+
+  "buy first product, use my office address"
+    → checkout_single_product(reference_position=1, address_hint="office")
+
+MODE 2 — CART CHECKOUT (checkout_cart):
+
+Use when user says:
+  "checkout my cart"
+  "proceed with my cart"
+  "pay for my cart"
+  "checkout everything"
+  "buy everything in my cart"
+
+Call: checkout_cart(address_hint=<hint if mentioned>)
+
+MODE 3 — GENERIC CHECKOUT → defaults to CART:
+
+If user just says "checkout" with NO product reference:
+  → checkout_cart()
+
+===== CHECKOUT STATE MACHINE =====
+
+After calling checkout_single_product or checkout_cart, the backend may respond with:
+1. "needs_variant_selection: true" — the product has multiple sizes/variants and user hasn't chosen.
+   → Ask the user: "What size would you like? Available: S, M, L, XL"
+   → When user responds with size, call checkout_single_product again with size=<their answer>
+
+2. "needs_address: true" — customer has no saved address.
+   → Ask the user: "What delivery address would you like to use?"
+   → Collect: name, address line 1, city, state, postal code, country
+   → The backend will save and use it.
+
+3. "awaiting_confirmation: true" — checkout summary shown.
+   → Ask: "Shall I proceed to payment?" or present the summary and ask for confirmation.
+   → When user says "yes" / "proceed" / "confirm" → call confirm_checkout(confirm=true)
+   → When user says "no" / "cancel" → tell them checkout was cancelled.
+
+DO NOT create an order without explicit user confirmation.
+DO NOT say "payment successful" — only the backend can verify payments.
+
+===== ADDRESS RULES =====
+
+- "use my default address" → address_hint="default"
+- "use my home address" → address_hint="home"
+- "use office" / "use my work address" → address_hint="office"
+- "use address 2" → address_hint="2"
+- No address mentioned → address_hint=null (backend resolves default if exists)
+
+DO NOT ask for address if user already specified one or if they have a default address that the backend has found.
+
+===== ORDINAL EXTRACTION =====
+
+Extract positions from natural language:
+  "first" / "1st" / "#1" / "number 1" → reference_position=1
+  "second" / "2nd" / "#2" / "number 2" → reference_position=2
+  "third" / "3rd" / "#3" / "number 3" → reference_position=3
+  "last" → position of last search result
+
+===== QUANTITY =====
+
+Extract from:
+  "buy 2 of the first one" → quantity=2
+  "buy the first one" → quantity=1 (default)
+  "checkout 3 of the second product" → quantity=3
 """
 
 
@@ -194,6 +541,7 @@ class AgentService:
         customer: Optional[Customer] = None,
         intent_service: Optional[IntentService] = None,
         product_service: Optional[ProductService] = None,
+        provider: Optional[str] = None,
     ) -> None:
         self.db = db
         self.merchant_context = merchant_context
@@ -201,13 +549,46 @@ class AgentService:
         self._intent_service = intent_service
         self._product_service = product_service
 
-        # Initialize Gemini client
+        if provider:
+            self.provider = provider.lower()
+        elif os.getenv("LLM_PROVIDER"):
+            self.provider = os.getenv("LLM_PROVIDER").lower()
+        else:
+            self.provider = (
+                getattr(settings, "LLM_PROVIDER", None)
+                or "huggingface"
+            ).lower()
+
+        hf_token = (
+            getattr(settings, "HF_TOKEN", None)
+            or os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+            or os.getenv("HUGGINGFACE_API_KEY")
+            or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        )
+        gemini_key = (
+            getattr(settings, "GEMINI_API_KEY", None)
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
+
+        if not provider:
+            explicit_env_provider = os.getenv("LLM_PROVIDER")
+            # If user explicitly set LLM_PROVIDER in .env, honor it! Only fallback if provider is entirely unspecified
+            if not explicit_env_provider and not getattr(settings, "LLM_PROVIDER", None):
+                if self.provider == "huggingface" and not hf_token and gemini_key:
+                    self.provider = "gemini"
+                elif self.provider == "gemini" and not gemini_key and hf_token:
+                    self.provider = "huggingface"
+
+        # Initialize clients
         self._gemini_client = None
+        self._hf_client = None
 
     @property
     def intent_service(self) -> IntentService:
         if self._intent_service is None:
-            self._intent_service = IntentService()
+            self._intent_service = IntentService(provider=self.provider)
         return self._intent_service
 
     @property
@@ -219,24 +600,58 @@ class AgentService:
     @property
     def gemini_client(self):
         if self._gemini_client is None:
-            api_key = settings.GEMINI_API_KEY
+            api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not api_key:
                 raise ValueError("GEMINI_API_KEY is not configured")
             self._gemini_client = genai.Client(api_key=api_key)
         return self._gemini_client
+
+    @property
+    def hf_client(self):
+        if self._hf_client is None:
+            token = (
+                getattr(settings, "HF_TOKEN", None)
+                or os.getenv("HF_TOKEN")
+                or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+                or os.getenv("HUGGINGFACE_API_KEY")
+                or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+            )
+            if not token:
+                raise ValueError(
+                    "HF_TOKEN is not configured. "
+                    "Please set HF_TOKEN or HUGGINGFACEHUB_ACCESS_TOKEN in your environment or .env file."
+                )
+            self._hf_client = InferenceClient(
+                token=token,
+                base_url=getattr(settings, "HF_API_BASE", None),
+            )
+        return self._hf_client
 
     # ---------------------------------------------------------------------------
     # Session Management
     # ---------------------------------------------------------------------------
 
     def get_or_create_session(self, session_id: str) -> AgentSession:
-        """Get existing session or create a new one."""
+        """Get existing session or create a new one, linking active customer cart."""
         session = self.db.query(AgentSession).filter(
             AgentSession.session_id == session_id,
             AgentSession.merchant_id == self.merchant_context.merchant_id
         ).first()
 
         if session:
+            # Update customer_id if not set and we have a customer now
+            if session.customer_id is None and self.customer is not None:
+                session.customer_id = self.customer.id
+                self.db.flush()
+            # If session has no cart_id but customer has an active cart, link it!
+            if self.customer and not session.cart_id:
+                active_cart = self.db.query(Cart).filter(
+                    Cart.customer_id == self.customer.id,
+                    Cart.status == CartStatus.ACTIVE
+                ).first()
+                if active_cart:
+                    session.cart_id = active_cart.id
+                    self.db.flush()
             return session
 
         # Create new session
@@ -245,33 +660,51 @@ class AgentService:
             merchant_id=self.merchant_context.merchant_id,
             customer_id=self.customer.id if self.customer else None,
         )
+
+        # Link existing active cart if customer already has one
+        if self.customer:
+            active_cart = self.db.query(Cart).filter(
+                Cart.customer_id == self.customer.id,
+                Cart.status == CartStatus.ACTIVE
+            ).first()
+            if active_cart:
+                session.cart_id = active_cart.id
+
         self.db.add(session)
         self.db.flush()
         return session
 
     def _get_cart(self, session: AgentSession) -> Cart:
-        """Get or create the customer's cart."""
+        """Get or create the customer's active cart."""
         if session.cart_id:
             cart = self.db.query(Cart).filter(
                 Cart.id == session.cart_id,
-                Cart.customer_id == session.customer_id
+                Cart.status == CartStatus.ACTIVE,
             ).first()
             if cart:
                 return cart
 
-        # Create or get active cart for customer
-        if not session.customer_id:
-            # Guest cart - we'll handle this with session-based cart
-            # For MVP, require customer_id (logged in)
-            raise ValueError("Customer not logged in. Cannot access cart.")
+        # Resolve customer context
+        effective_customer_id = session.customer_id or (self.customer.id if self.customer else None)
+
+        if not effective_customer_id and getattr(settings, "DEBUG", False):
+            fallback_customer = self.db.query(Customer).filter(
+                Customer.merchant_id == self.merchant_context.merchant_id
+            ).order_by(Customer.created_at.asc()).first()
+            if fallback_customer:
+                effective_customer_id = fallback_customer.id
+                session.customer_id = fallback_customer.id
+
+        if not effective_customer_id:
+            raise ValueError("Customer not logged in. Please provide an X-Customer-Id header to access cart.")
 
         cart = self.db.query(Cart).filter(
-            Cart.customer_id == session.customer_id,
-            Cart.status == "active"
+            Cart.customer_id == effective_customer_id,
+            Cart.status == CartStatus.ACTIVE
         ).first()
 
         if not cart:
-            cart = Cart(customer_id=session.customer_id)
+            cart = Cart(customer_id=effective_customer_id)
             self.db.add(cart)
             self.db.flush()
 
@@ -611,11 +1044,43 @@ class AgentService:
                     f"({'in stock' if p['in_stock'] else 'out of stock'}){variant_info}"
                 )
 
+        # Cart summary context
+        cart_to_summarize = None
         if session.cart_id:
-            parts.append(f"Active cart: {session.cart_id}")
+            cart_to_summarize = self.db.query(Cart).filter(Cart.id == session.cart_id).first()
+        elif self.customer:
+            cart_to_summarize = self.db.query(Cart).filter(
+                Cart.customer_id == self.customer.id,
+                Cart.status == CartStatus.ACTIVE
+            ).first()
+            if cart_to_summarize:
+                session.cart_id = cart_to_summarize.id
+
+        if cart_to_summarize and cart_to_summarize.items:
+            cart_descs = []
+            for item in cart_to_summarize.items:
+                variant = item.variant
+                product_title = variant.product.title if variant and variant.product else "Item"
+                color_info = f" {variant.color}" if variant and variant.color else ""
+                size_info = f" {variant.size}" if variant and variant.size else ""
+                cart_descs.append(f"{item.quantity}x {product_title}{color_info}{size_info} (price: {item.price_at_addition})")
+            parts.append(f"Customer Cart ({len(cart_to_summarize.items)} items):\n  " + "\n  ".join(cart_descs))
+        elif cart_to_summarize:
+            parts.append("Customer Cart: empty (0 items)")
 
         if self.customer:
             parts.append(f"Customer: {self.customer.name} ({self.customer.email})")
+
+        # Checkout state context: tell the LLM if there's a pending checkout
+        if session.checkout_state:
+            cs = session.checkout_state
+            step = cs.get("step", "unknown")
+            mode = cs.get("mode", "unknown")
+            parts.append(
+                f"PENDING CHECKOUT: mode={mode}, step={step}. "
+                f"If the user confirms (yes/proceed/confirm), call confirm_checkout(confirm=true). "
+                f"If they cancel, tell them checkout was cancelled and clear state."
+            )
 
         return "\n".join(parts) if parts else "New session."
 
@@ -625,20 +1090,198 @@ class AgentService:
         context: str,
         session: AgentSession,
     ) -> Dict[str, Any]:
-        """Generate response using Gemini with function calling."""
-        # Build the prompt with context
+        """Generate response using configured LLM provider with function calling and automatic fallback."""
+        provider = getattr(self, "provider", None)
+        if not provider:
+            if getattr(self, "_gemini_client", None) is not None:
+                provider = "gemini"
+            elif getattr(self, "_hf_client", None) is not None:
+                provider = "huggingface"
+            else:
+                provider = getattr(settings, "LLM_PROVIDER", "huggingface").lower()
+
+        if provider == "gemini":
+            try:
+                return self._generate_with_tools_gemini(user_message, context, session)
+            except Exception as e:
+                logger.warning(f"Gemini agent failed: {e}. Checking for Hugging Face fallback...")
+                hf_token = (
+                    getattr(settings, "HF_TOKEN", None)
+                    or os.getenv("HF_TOKEN")
+                    or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+                    or os.getenv("HUGGINGFACE_API_KEY")
+                )
+                if hf_token:
+                    try:
+                        return self._generate_with_tools_huggingface(user_message, context, session)
+                    except Exception as hf_err:
+                        logger.error(f"Hugging Face fallback also failed: {hf_err}")
+                raise
+        else:
+            try:
+                return self._generate_with_tools_huggingface(user_message, context, session)
+            except Exception as e:
+                logger.warning(f"Hugging Face agent failed: {e}. Checking for Gemini fallback...")
+                gemini_key = (
+                    getattr(settings, "GEMINI_API_KEY", None)
+                    or os.getenv("GEMINI_API_KEY")
+                    or os.getenv("GOOGLE_API_KEY")
+                )
+                if gemini_key:
+                    try:
+                        return self._generate_with_tools_gemini(user_message, context, session)
+                    except Exception as gem_err:
+                        logger.error(f"Gemini fallback also failed: {gem_err}")
+                raise
+
+    def _generate_with_tools_huggingface(
+        self,
+        user_message: str,
+        context: str,
+        session: AgentSession,
+    ) -> Dict[str, Any]:
+        """Generate response using Hugging Face Inference API with tool calling."""
         prompt = f"""Context:
 {context}
 
 User: {user_message}
 
-IMPORTANT: The context above shows the LAST SEARCH RESULTS with position numbers (1, 2, 3...) and variant_ids.
-- If the user says "add the first one", "add first product", "add #1", "add product 1", "add second one", "add the third product", "put the first shirt in my cart", etc. — use the reference_position parameter.
-- Find the position number from the context (1 for first, 2 for second, etc.) and call add_to_cart with reference_position=<that number>.
-- If the user specifies a variant (e.g., "add the second one in Large"), call get_product first with the product_id from that position, then call add_to_cart with the specific variant_id.
-- Do NOT call search_products again unless the user asks for a NEW search.
-- When user says "add X of the [position] one", use quantity=X. Default quantity is 1.
-- NEVER try to construct a product_id from the position number (e.g., don't use product_id="1" for "first product").
+IMPORTANT ROUTING RULES (use context above for positions/IDs):
+
+ADD TO CART:
+- "add the first one", "add #1", "add second one", etc. → add_to_cart(reference_position=N)
+- If user specifies variant (e.g. "in Large") → call get_product first, then add_to_cart with variant_id
+- Explicit UUID provided → call get_product, then add_to_cart with variant_id
+- NEVER use product_id="1" for "first product" — position is an integer, IDs are UUIDs
+
+PURCHASE / CHECKOUT:
+- "buy first product", "proceed payment of 1st product", "purchase the first one", "pay for 2nd item", "checkout the third one"
+  → call checkout_single_product(reference_position=N)
+  * N = ordinal from user: "1st"/"first"=1, "2nd"/"second"=2, "third"=3, etc.
+  * Do NOT call get_cart or checkout_cart for single-item purchases
+  * The backend resolves position → actual product UUID — do NOT invent UUIDs
+- "checkout my cart", "checkout everything", "pay for everything in cart" → call checkout_cart()
+- Plain "checkout" with no product reference → call checkout_cart()
+- User confirms pending checkout ("yes", "proceed", "confirm") → call confirm_checkout(confirm=true)
+- Do NOT call search_products unless user asks for a NEW search
+"""
+        primary_model = getattr(settings, "HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+        candidate_models = [primary_model, "Qwen/Qwen2.5-72B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3"]
+        candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
+
+        messages = [
+            {"role": "system", "content": AGENT_SYSTEM_INSTRUCTION},
+            {"role": "user", "content": prompt},
+        ]
+
+        last_exc = None
+        for model_name in candidate_models:
+            for attempt in range(2):
+                try:
+                    response = self.hf_client.chat_completion(
+                        model=model_name,
+                        messages=messages,
+                        tools=HF_AGENT_TOOLS,
+                        tool_choice="auto",
+                        temperature=0.0,
+                        max_tokens=600,
+                    )
+                    return self._process_response_huggingface(response, session)
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc)
+                    if "429" in err_str or "Rate limit" in err_str or "temporarily unavailable" in err_str:
+                        if model_name != candidate_models[-1]:
+                            break
+                        continue
+                    raise
+
+        if last_exc:
+            raise last_exc
+        return {"text": "I'm having trouble processing that. Please try again.", "tool_calls": [], "tool_results": []}
+
+    def _process_response_huggingface(self, response, session: AgentSession) -> Dict[str, Any]:
+        """Process Hugging Face response and execute any tool calls."""
+        result = {
+            "text": "",
+            "tool_calls": [],
+            "tool_results": [],
+        }
+
+        if not response or not response.choices:
+            result["text"] = "I'm having trouble processing that. Please try again."
+            return result
+
+        choice = response.choices[0]
+        message = choice.message
+
+        if message.content:
+            result["text"] = message.content.strip()
+
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                func_name = getattr(tc.function, "name", None) or (tc.function.get("name") if isinstance(tc.function, dict) else None)
+                raw_args = getattr(tc.function, "arguments", None) or (tc.function.get("arguments") if isinstance(tc.function, dict) else {})
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args) if raw_args.strip() else {}
+                    except Exception:
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+
+                if func_name:
+                    result["tool_calls"].append({
+                        "name": func_name,
+                        "args": args,
+                    })
+
+        # Execute tool calls
+        for tool_call in result["tool_calls"]:
+            tool_result = self._execute_tool(tool_call["name"], tool_call["args"], session)
+            result["tool_results"].append({
+                "name": tool_call["name"],
+                "result": tool_result,
+            })
+
+        # If tools were called, generate a follow-up response
+        if result["tool_results"]:
+            result["text"] = self._generate_followup(result, session)
+
+        return result
+
+    def _generate_with_tools_gemini(
+        self,
+        user_message: str,
+        context: str,
+        session: AgentSession,
+    ) -> Dict[str, Any]:
+        """Generate response using Gemini with function calling."""
+        prompt = f"""Context:
+{context}
+
+User: {user_message}
+
+IMPORTANT ROUTING RULES (use context above for positions/IDs):
+
+ADD TO CART:
+- "add the first one", "add #1", "add second one", etc. → add_to_cart(reference_position=N)
+- If user specifies variant (e.g. "in Large") → call get_product first, then add_to_cart with variant_id
+- Explicit UUID provided → call get_product, then add_to_cart with variant_id
+- NEVER use product_id="1" for "first product" — position is an integer, IDs are UUIDs
+
+PURCHASE / CHECKOUT:
+- "buy first product", "proceed payment of 1st product", "purchase the first one", "pay for 2nd item", "checkout the third one"
+  → call checkout_single_product(reference_position=N)
+  * N = ordinal from user: "1st"/"first"=1, "2nd"/"second"=2, "third"=3, etc.
+  * Do NOT call get_cart or checkout_cart for single-item purchases
+  * The backend resolves position → actual product UUID — do NOT invent UUIDs
+- "checkout my cart", "checkout everything", "pay for everything in cart" → call checkout_cart()
+- Plain "checkout" with no product reference → call checkout_cart()
+- User confirms pending checkout ("yes", "proceed", "confirm") → call confirm_checkout(confirm=true)
+- Do NOT call search_products unless user asks for a NEW search
 """
 
         config = types.GenerateContentConfig(
@@ -648,16 +1291,32 @@ IMPORTANT: The context above shows the LAST SEARCH RESULTS with position numbers
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
-        # Use the intent model for agent orchestration
-        model_name = getattr(settings, "GEMINI_INTENT_MODEL", "gemini-3.6-flash")
+        primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or os.getenv("GEMINI_INTENT_MODEL", "gemini-2.5-flash")
+        candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+        candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
-        response = self.gemini_client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=config,
-        )
+        last_exc = None
+        for model_name in candidate_models:
+            for attempt in range(2):
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config,
+                    )
+                    return self._process_response(response, session)
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        if model_name != candidate_models[-1]:
+                            break
+                        continue
+                    raise
 
-        return self._process_response(response, session)
+        if last_exc:
+            raise last_exc
+        return {"text": "I'm having trouble processing that. Please try again.", "tool_calls": [], "tool_results": []}
 
     def _process_response(self, response, session: AgentSession) -> Dict[str, Any]:
         """Process Gemini response and execute any tool calls."""
@@ -728,6 +1387,20 @@ IMPORTANT: The context above shows the LAST SEARCH RESULTS with position numbers
         elif tool_name == "add_to_cart":
             return self._execute_add_to_cart(args, session)
 
+        # New purchase-scope tools
+        elif tool_name == "checkout_single_product":
+            return self._execute_checkout_single_product(args, session)
+
+        elif tool_name == "checkout_cart":
+            return self._execute_checkout_cart(args, session)
+
+        elif tool_name == "confirm_checkout":
+            return self._execute_confirm_checkout(args, session)
+
+        # Legacy: keep old "checkout" name for backwards compat in case LLM still uses it
+        elif tool_name == "checkout":
+            return self._execute_checkout_cart(args, session)
+
         else:
             return {"success": False, "error": f"Unknown tool: {tool_name}", "message": "Unknown tool."}
 
@@ -777,6 +1450,398 @@ IMPORTANT: The context above shows the LAST SEARCH RESULTS with position numbers
             return {"success": False, "error": "Invalid ID format", "message": "Invalid UUID format."}
 
         return self.tool_add_to_cart(session, product_id, variant_id, quantity)
+
+    def _execute_checkout_single_product(
+        self, args: Dict[str, Any], session: AgentSession
+    ) -> Dict[str, Any]:
+        """
+        Execute checkout for a SINGLE product from last search results.
+
+        Flow:
+        1. Resolve product from reference_position or explicit product_id
+        2. Check variant selection needed
+        3. Resolve address
+        4. If address needed, ask user
+        5. Show summary → store checkout_state as awaiting_confirmation
+        6. Return summary to user for confirmation
+        """
+        from app.services.purchase_intent_resolver import (
+            PurchaseIntentResolver, PurchaseIntentError, InsufficientInventoryError
+        )
+        from app.services.address_service import AddressService
+        from app.services.checkout_service import SingleProductCheckoutService
+
+        reference_position = args.get("reference_position")
+        product_id_str = args.get("product_id")
+        quantity = int(args.get("quantity", 1))
+        size = args.get("size")
+        address_hint = args.get("address_hint")
+
+        logger.info(
+            f"[PURCHASE_DEBUG] ACTION=CHECKOUT PURCHASE_SCOPE=SINGLE_PRODUCT "
+            f"REFERENCE_POSITION={reference_position} PRODUCT_ID_STR={product_id_str} "
+            f"QUANTITY={quantity} SIZE={size} ADDRESS_HINT={address_hint}"
+        )
+
+        # ---- Step 1: Resolve product + variant ----
+        try:
+            resolver = PurchaseIntentResolver(
+                db=self.db,
+                merchant_id=self.merchant_context.merchant_id,
+            )
+            target = resolver.resolve_single_product(
+                session=session,
+                reference_position=reference_position,
+                product_id_str=product_id_str,
+                quantity=quantity,
+                size=size,
+            )
+        except PurchaseIntentError as e:
+            logger.warning(f"[PURCHASE_DEBUG] RESOLVE_ERROR={e}")
+            return {"success": False, "error": str(e), "message": str(e)}
+        except Exception as e:
+            logger.error(f"[PURCHASE_DEBUG] UNEXPECTED_RESOLVE_ERROR={e}", exc_info=True)
+            return {"success": False, "error": str(e), "message": f"Could not resolve product: {e}"}
+
+        # ---- Step 2: Variant selection needed? ----
+        if target.needs_variant_selection:
+            sizes = [v["size"] for v in target.available_variants if v.get("size")]
+            colors = [v["color"] for v in target.available_variants if v.get("color")]
+            options = sizes or colors
+            return {
+                "success": True,
+                "needs_variant_selection": True,
+                "product_title": target.product.title,
+                "available_variants": target.available_variants,
+                "message": (
+                    f"What size would you like for '{target.product.title}'? "
+                    f"Available: {', '.join(options)}"
+                    if options else
+                    f"Please select a variant for '{target.product.title}'."
+                ),
+            }
+
+        logger.info(
+            f"[PURCHASE_DEBUG] RESOLVED_PRODUCT_ID={target.product.id} "
+            f"RESOLVED_VARIANT_ID={target.variant.id} "
+            f"UNIT_PRICE={target.unit_price} QUANTITY={quantity}"
+        )
+
+        # ---- Step 3: Resolve address ----
+        address = None
+        address_ref = "none"
+        if self.customer:
+            addr_service = AddressService(self.db)
+            address = addr_service.resolve_address_hint(self.customer.id, address_hint)
+            address_ref = str(address.id) if address else "none"
+
+        logger.info(f"[PURCHASE_DEBUG] ADDRESS_SELECTION={address_ref}")
+
+        # ---- Step 4: Need address from user? ----
+        if not address and self.customer:
+            # Store partial checkout state so next message can continue
+            session.checkout_state = {
+                "mode": "SINGLE_PRODUCT",
+                "step": "awaiting_address",
+                "resolved_product_id": str(target.product.id),
+                "resolved_variant_id": str(target.variant.id),
+                "quantity": quantity,
+                "address_id": None,
+            }
+            self.db.flush()
+            return {
+                "success": True,
+                "needs_address": True,
+                "message": "What delivery address would you like to use? Please provide: name, address line 1, city, state, postal code, and country.",
+            }
+
+        # ---- Step 5: Build and store checkout summary ----
+        checkout_svc = SingleProductCheckoutService(
+            db=self.db,
+            merchant_context=self.merchant_context,
+            customer=self.customer,
+        )
+        summary = checkout_svc.build_summary(
+            product=target.product,
+            variant=target.variant,
+            quantity=quantity,
+            address=address,
+        )
+        total = target.unit_price * quantity
+
+        logger.info(f"[PURCHASE_DEBUG] CHECKOUT_TOTAL={total} ADDRESS_ID={address_ref}")
+
+        # Store state for confirmation step
+        session.checkout_state = {
+            "mode": "SINGLE_PRODUCT",
+            "step": "awaiting_confirmation",
+            "resolved_product_id": str(target.product.id),
+            "resolved_variant_id": str(target.variant.id),
+            "quantity": quantity,
+            "address_id": str(address.id) if address else None,
+            "summary": summary,
+        }
+        self.db.flush()
+
+        return {
+            "success": True,
+            "awaiting_confirmation": True,
+            "checkout_summary": summary,
+            "message": (
+                f"Here's your order summary:\n"
+                f"  Product: {target.product.title}"
+                + (f" ({target.variant.color or ''} {target.variant.size or ''}).strip()" if (target.variant.color or target.variant.size) else "")
+                + f"\n  Quantity: {quantity}\n"
+                f"  Unit price: ₹{target.unit_price}\n"
+                f"  Total: ₹{total}\n"
+                + (f"  Delivery to: {summary.get('delivery_address')}\n" if summary.get('delivery_address') else "  No delivery address set.\n")
+                + "\nShall I proceed to payment?"
+            ),
+        }
+
+    def _execute_checkout_cart(
+        self, args: Dict[str, Any], session: AgentSession
+    ) -> Dict[str, Any]:
+        """
+        Execute checkout for the ENTIRE active cart.
+
+        Flow:
+        1. Load and validate cart
+        2. Resolve address
+        3. Show summary → store checkout_state as awaiting_confirmation
+        """
+        from app.services.checkout_service import CheckoutService, CartValidationResult
+        from app.services.address_service import AddressService
+
+        address_hint = args.get("address_hint")
+
+        logger.info(
+            f"[PURCHASE_DEBUG] ACTION=CHECKOUT PURCHASE_SCOPE=CART ADDRESS_HINT={address_hint}"
+        )
+
+        try:
+            checkout_service = CheckoutService(
+                db=self.db,
+                merchant_context=self.merchant_context,
+                customer=self.customer,
+            )
+            cart = checkout_service.get_or_create_active_cart(session.session_id)
+            validation = checkout_service.validate_and_calculate(cart)
+        except Exception as e:
+            return {"success": False, "error": str(e), "message": str(e)}
+
+        # Resolve address
+        address = None
+        address_ref = "none"
+        if self.customer:
+            addr_service = AddressService(self.db)
+            address = addr_service.resolve_address_hint(self.customer.id, address_hint)
+            address_ref = str(address.id) if address else "none"
+
+        logger.info(
+            f"[PURCHASE_DEBUG] CART_ITEM_COUNT={len(validation.items)} "
+            f"CART_SUBTOTAL={validation.subtotal} ADDRESS_SELECTION={address_ref}"
+        )
+
+        if not address and self.customer:
+            session.checkout_state = {
+                "mode": "CART",
+                "step": "awaiting_address",
+                "address_id": None,
+            }
+            self.db.flush()
+            return {
+                "success": True,
+                "needs_address": True,
+                "message": "What delivery address would you like to use? Please provide: name, address line 1, city, state, postal code, and country.",
+            }
+
+        # Build address display
+        address_display = None
+        if address:
+            parts = [
+                address.recipient_name or (self.customer.name if self.customer else ""),
+                address.address_line_1,
+                f"{address.city}, {address.state} {address.postal_code}",
+                address.country,
+            ]
+            address_display = ", ".join(p for p in parts if p)
+
+        logger.info(f"[PURCHASE_DEBUG] CHECKOUT_TOTAL={validation.subtotal}")
+
+        summary = {
+            "item_count": len(validation.items),
+            "subtotal": str(validation.subtotal),
+            "total": str(validation.subtotal),
+            "currency": "INR",
+            "delivery_address": address_display,
+            "address_id": str(address.id) if address else None,
+            "warnings": validation.warnings,
+        }
+
+        session.checkout_state = {
+            "mode": "CART",
+            "step": "awaiting_confirmation",
+            "address_id": str(address.id) if address else None,
+            "summary": summary,
+        }
+        self.db.flush()
+
+        return {
+            "success": True,
+            "awaiting_confirmation": True,
+            "checkout_summary": summary,
+            "message": (
+                f"Here's your cart summary:\n"
+                f"  {len(validation.items)} item(s), total: ₹{validation.subtotal}\n"
+                + (f"  Delivery to: {address_display}\n" if address_display else "  No delivery address set.\n")
+                + (f"  ⚠️ {'; '.join(validation.warnings)}\n" if validation.warnings else "")
+                + "\nShall I proceed to payment?"
+            ),
+        }
+
+    def _execute_confirm_checkout(
+        self, args: Dict[str, Any], session: AgentSession
+    ) -> Dict[str, Any]:
+        """
+        Execute the final confirmed checkout step.
+        Creates the Order (and address snapshot).
+        Razorpay NOT integrated yet.
+        """
+        from app.services.checkout_service import (
+            CheckoutService, SingleProductCheckoutService, CartValidationResult
+        )
+        from app.services.address_service import AddressService
+        from app.models.product import Product, ProductVariant
+        from app.models.customer_address import CustomerAddress
+
+        confirm = args.get("confirm", False)
+        if not confirm:
+            return {
+                "success": False,
+                "error": "Confirmation required",
+                "message": "Please confirm by saying 'yes' or 'proceed' to complete your order.",
+            }
+
+        state = session.checkout_state
+        if not state or state.get("step") != "awaiting_confirmation":
+            return {
+                "success": False,
+                "error": "No pending checkout",
+                "message": "There is no pending checkout to confirm. Please start checkout again.",
+            }
+
+        mode = state.get("mode")
+        address_id_str = state.get("address_id")
+
+        # Resolve address object
+        address = None
+        if address_id_str and self.customer:
+            addr_service = AddressService(self.db)
+            try:
+                address = addr_service.get_address_by_id(self.customer.id, uuid.UUID(address_id_str))
+            except Exception:
+                pass
+
+        try:
+            if mode == "SINGLE_PRODUCT":
+                product_id = uuid.UUID(state["resolved_product_id"])
+                variant_id = uuid.UUID(state["resolved_variant_id"])
+                quantity = int(state.get("quantity", 1))
+
+                product = self.db.query(Product).filter(Product.id == product_id).first()
+                variant = self.db.query(ProductVariant).filter(ProductVariant.id == variant_id).first()
+
+                if not product or not variant:
+                    return {"success": False, "error": "Product not found", "message": "Could not find the product for this checkout."}
+
+                svc = SingleProductCheckoutService(
+                    db=self.db,
+                    merchant_context=self.merchant_context,
+                    customer=self.customer,
+                )
+                result = svc.execute_checkout(
+                    product=product,
+                    variant=variant,
+                    quantity=quantity,
+                    address=address,
+                )
+
+                logger.info(
+                    f"[PURCHASE_DEBUG] ORDER_CREATED MODE=SINGLE_PRODUCT ORDER_ID={result.order_id} "
+                    f"TOTAL={result.total_amount}"
+                )
+
+                # Clear checkout state
+                session.checkout_state = None
+                self.db.flush()
+
+                return {
+                    "success": True,
+                    "order_id": str(result.order_id),
+                    "total_amount": str(result.total_amount),
+                    "currency": result.currency,
+                    "status": result.status,
+                    "message": (
+                        f"Order placed successfully! Order ID: {result.order_id}. "
+                        f"Total: ₹{result.total_amount}. "
+                        f"Payment integration coming soon — your order is confirmed and pending payment."
+                    ),
+                }
+
+            elif mode == "CART":
+                checkout_service = CheckoutService(
+                    db=self.db,
+                    merchant_context=self.merchant_context,
+                    customer=self.customer,
+                )
+                cart = checkout_service.get_or_create_active_cart(session.session_id)
+                validation = checkout_service.validate_and_calculate(cart)
+                order = checkout_service.create_order(
+                    cart=cart,
+                    validation_result=validation,
+                    address=address,
+                    customer_name=self.customer.name if self.customer else None,
+                )
+                self.db.commit()
+
+                logger.info(
+                    f"[PURCHASE_DEBUG] ORDER_CREATED MODE=CART ORDER_ID={order.id} "
+                    f"TOTAL={order.total_amount}"
+                )
+
+                # Clear checkout state
+                session.checkout_state = None
+                self.db.flush()
+
+                return {
+                    "success": True,
+                    "order_id": str(order.id),
+                    "total_amount": str(order.total_amount),
+                    "currency": "INR",
+                    "status": "pending_payment",
+                    "message": (
+                        f"Order placed successfully! Order ID: {order.id}. "
+                        f"Total: ₹{order.total_amount}. "
+                        f"Payment integration coming soon — your order is confirmed and pending payment."
+                    ),
+                }
+
+            else:
+                return {
+                    "success": False,
+                    "error": "Invalid checkout state",
+                    "message": "Unexpected checkout mode. Please start checkout again.",
+                }
+
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"[PURCHASE_DEBUG] CONFIRM_CHECKOUT_ERROR={e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "message": f"Could not complete the order: {e}",
+            }
 
     def _generate_followup(
         self,
@@ -845,7 +1910,23 @@ IMPORTANT: The context above shows the LAST SEARCH RESULTS with position numbers
                 else:
                     summary_parts.append(f"Could not add to cart: {res.get('message', 'Unknown error')}")
 
-        # Now ask Gemini to formulate a natural response
+            elif name in ("checkout_single_product", "checkout_cart", "confirm_checkout"):
+                if res.get("message"):
+                    summary_parts.append(res.get("message"))
+                elif res.get("error"):
+                    summary_parts.append(f"Checkout error: {res.get('error')}")
+
+            elif name == "checkout":
+                if res.get("success"):
+                    amount_inr = res.get("amount_paise", 0) / 100
+                    summary_parts.append(
+                        f"Checkout initiated successfully. Your total is ₹{amount_inr:.2f}. "
+                        f"Razorpay order created: {res.get('razorpay_order_id')}. "
+                        f"Please complete payment on the frontend using the provided order details."
+                    )
+                else:
+                    summary_parts.append(f"Checkout failed: {res.get('message', 'Unknown error')}")
+
         prompt = f"""Based on these tool results, provide a concise, helpful response to the customer:
 
 {chr(10).join(summary_parts)}
@@ -857,20 +1938,106 @@ Rules:
 - If there's an error, explain it clearly
 """
 
-        config = types.GenerateContentConfig(
-            system_instruction=AGENT_SYSTEM_INSTRUCTION,
-            temperature=0.0,
-        )
+        fallback_text = "\n".join(summary_parts) if summary_parts else "Done."
 
-        model_name = getattr(settings, "GEMINI_INTENT_MODEL", "gemini-3.6-flash")
+        provider = getattr(self, "provider", None)
+        if not provider:
+            if getattr(self, "_gemini_client", None) is not None:
+                provider = "gemini"
+            elif getattr(self, "_hf_client", None) is not None:
+                provider = "huggingface"
+            else:
+                provider = getattr(settings, "LLM_PROVIDER", "huggingface").lower()
 
-        followup_response = self.gemini_client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=config,
-        )
+        if provider == "gemini":
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=AGENT_SYSTEM_INSTRUCTION,
+                    temperature=0.0,
+                )
+                primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-2.5-flash"
+                candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+                candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
-        return followup_response.text or "Done."
+                for model_name in candidate_models:
+                    try:
+                        followup_response = self.gemini_client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config=config,
+                        )
+                        if followup_response and followup_response.text:
+                            return followup_response.text
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Try Hugging Face fallback if configured
+            hf_token = getattr(settings, "HF_TOKEN", None) or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+            if hf_token:
+                try:
+                    model_name = getattr(settings, "HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+                    messages = [
+                        {"role": "system", "content": AGENT_SYSTEM_INSTRUCTION},
+                        {"role": "user", "content": prompt},
+                    ]
+                    followup_response = self.hf_client.chat_completion(
+                        model=model_name,
+                        messages=messages,
+                        temperature=0.0,
+                        max_tokens=400,
+                    )
+                    if followup_response and followup_response.choices and followup_response.choices[0].message:
+                        return followup_response.choices[0].message.content or fallback_text
+                except Exception:
+                    pass
+
+            return fallback_text
+        else:
+            try:
+                primary_model = getattr(settings, "HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+                candidate_models = [primary_model, "Qwen/Qwen2.5-72B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3"]
+                candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
+                messages = [
+                    {"role": "system", "content": AGENT_SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": prompt},
+                ]
+
+                for model_name in candidate_models:
+                    try:
+                        followup_response = self.hf_client.chat_completion(
+                            model=model_name,
+                            messages=messages,
+                            temperature=0.0,
+                            max_tokens=400,
+                        )
+                        if followup_response and followup_response.choices and followup_response.choices[0].message:
+                            return followup_response.choices[0].message.content or fallback_text
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Try Gemini fallback if configured
+            gemini_key = getattr(settings, "GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if gemini_key:
+                try:
+                    config = types.GenerateContentConfig(
+                        system_instruction=AGENT_SYSTEM_INSTRUCTION,
+                        temperature=0.0,
+                    )
+                    followup_response = self.gemini_client.models.generate_content(
+                        model=getattr(settings, "GEMINI_INTENT_MODEL", "gemini-2.5-flash"),
+                        contents=prompt,
+                        config=config,
+                    )
+                    if followup_response and followup_response.text:
+                        return followup_response.text
+                except Exception:
+                    pass
+
+            return fallback_text
 
     def _update_session_from_tools(self, session: AgentSession, result: Dict[str, Any]):
         """Update session state based on tool execution results."""
@@ -897,6 +2064,10 @@ Rules:
         product_detail = None
         cart_summary = None
         cart_updated = False
+        checkout_summary = None
+        checkout_state_out = None
+        needs_variant_selection = False
+        available_variants: List[Dict[str, Any]] = []
 
         for tool_result in result.get("tool_results", []):
             name = tool_result["name"]
@@ -920,6 +2091,33 @@ Rules:
             elif name == "add_to_cart" and res.get("success"):
                 cart_updated = True
 
+            elif name in ("checkout_single_product", "checkout_cart") and res.get("success"):
+                if res.get("needs_variant_selection"):
+                    needs_variant_selection = True
+                    available_variants = res.get("available_variants", [])
+                elif res.get("awaiting_confirmation"):
+                    checkout_summary = res.get("checkout_summary")
+                    checkout_state_out = session.checkout_state
+
+            elif name == "confirm_checkout" and res.get("success"):
+                checkout_summary = {
+                    "order_id": res.get("order_id"),
+                    "total_amount": res.get("total_amount"),
+                    "currency": res.get("currency"),
+                    "status": res.get("status"),
+                }
+
+            # Legacy: old "checkout" tool (Razorpay flow - keep for backwards compat)
+            elif name == "checkout" and res.get("success"):
+                checkout_summary = {
+                    "order_id": res.get("order_id"),
+                    "razorpay_order_id": res.get("razorpay_order_id"),
+                    "amount_paise": res.get("amount_paise"),
+                    "currency": res.get("currency"),
+                    "key_id": res.get("key_id"),
+                    "status": res.get("status"),
+                }
+
         return AgentChatResponse(
             session_id=session.session_id,
             message=result.get("text", ""),
@@ -927,4 +2125,8 @@ Rules:
             cart_updated=cart_updated,
             product_detail=product_detail,
             cart_summary=cart_summary,
+            checkout_summary=checkout_summary,
+            checkout_state=checkout_state_out,
+            needs_variant_selection=needs_variant_selection,
+            available_variants=available_variants,
         )

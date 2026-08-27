@@ -555,13 +555,13 @@ class TestAddToCartReferenceResolution:
                 def first_side_effect():
                     call_count[0] += 1
                     if call_count[0] == 1:
-                        return product  # Product found
+                        return product
                     elif call_count[0] == 2:
-                        return variant  # Variant found
+                        return variant
                     elif call_count[0] == 3:
-                        return None  # No existing cart
+                        return None
                     elif call_count[0] == 4:
-                        return None  # No existing cart item
+                        return None
                     return None
                 
                 q_filter.first = first_side_effect
@@ -596,6 +596,36 @@ class TestAddToCartReferenceResolution:
         assert result["quantity"] == 1
         # Verify it used the first product (Product 1)
         assert "Product 1" in result["message"]
+
+    def test_session_customer_id_updated_on_subsequent_request(self, mock_merchant, mock_customer):
+        """Test that session.customer_id is updated when customer is provided in subsequent request."""
+        from app.services.agent_service import AgentService
+        from app.core.merchant_context import MerchantContext
+
+        mock_db = MagicMock()
+        
+        # Create a session with customer_id=None (simulating first request without customer)
+        from app.models.agent_session import AgentSession
+        session = AgentSession(
+            session_id="test-session",
+            merchant_id=mock_merchant.id,
+            customer_id=None,  # No customer initially
+        )
+        
+        # Mock the DB query to return this session
+        mock_db.query.return_value.filter.return_value.first.return_value = session
+
+        service = AgentService(
+            db=mock_db,
+            merchant_context=MerchantContext(merchant_id=mock_merchant.id),
+            customer=mock_customer,  # Customer provided in subsequent request
+        )
+
+        # Call get_or_create_session - should update session.customer_id
+        retrieved_session = service.get_or_create_session("test-session")
+
+        assert retrieved_session.customer_id == mock_customer.id
+        mock_db.flush.assert_called()
 
     def test_add_to_cart_with_reference_position_second(self, mock_merchant, mock_customer, mock_products):
         """Test add_to_cart with reference_position=2 resolves to second search result."""
@@ -895,3 +925,74 @@ class TestAgentSchemas:
 
         assert product.title == "Black Shirt"
         assert product.position == 1
+
+
+class TestCrossSessionCartPersistence:
+    """Tests ensuring cart items persist across different session IDs for the same merchant & customer."""
+
+    def test_cart_shared_across_different_sessions(self, mock_merchant, mock_customer, mock_products):
+        """Test adding to cart in session_x and viewing cart in session_y shares the same cart."""
+        from app.services.agent_service import AgentService
+        from app.core.merchant_context import MerchantContext
+        from app.models.enums import CartStatus
+
+        mock_db = MagicMock()
+        product = mock_products[0]
+        variant = product.variants[0]
+
+        # Existing active cart
+        cart = Cart(id=uuid.uuid4(), customer_id=mock_customer.id, status=CartStatus.ACTIVE)
+        cart_item = CartItem(
+            id=uuid.uuid4(),
+            cart_id=cart.id,
+            variant_id=variant.id,
+            quantity=1,
+            price_at_addition=variant.price,
+        )
+        cart.items = [cart_item]
+
+        # First session "session_x"
+        service = AgentService(
+            db=mock_db,
+            merchant_context=MerchantContext(merchant_id=mock_merchant.id),
+            customer=mock_customer,
+        )
+
+        def mock_query(model):
+            q = MagicMock()
+            if model.__name__ == "AgentSession":
+                # Simulate new session creation
+                q_filter = MagicMock()
+                q_filter.first.return_value = None
+                q.filter.return_value = q_filter
+            elif model.__name__ == "Cart":
+                q_filter = MagicMock()
+                q_filter.first.return_value = cart
+                q.filter.return_value = q_filter
+            elif model.__name__ == "CartItem":
+                q_filter = MagicMock()
+                q_filter.all.return_value = [cart_item]
+                q.filter.return_value = q_filter
+            elif model.__name__ == "ProductVariant":
+                q_filter = MagicMock()
+                q_filter.first.return_value = variant
+                q.filter.return_value = q_filter
+            elif model.__name__ == "Product":
+                q_filter = MagicMock()
+                q_filter.first.return_value = product
+                q.filter.return_value = q_filter
+            return q
+
+        mock_db.query.side_effect = mock_query
+
+        # Session Y is created
+        session_y = service.get_or_create_session("session_y")
+
+        # Verify active cart is linked to new session Y
+        assert session_y.cart_id == cart.id
+
+        # Verify tool_get_cart in session Y retrieves the item
+        cart_result = service.tool_get_cart(session_y)
+        assert cart_result["success"] is True
+        assert len(cart_result["items"]) == 1
+        assert cart_result["items"][0]["quantity"] == 1

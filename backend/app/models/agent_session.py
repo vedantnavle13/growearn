@@ -41,6 +41,11 @@ class AgentSession(Base):
     )
     current_intent: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     last_search_results: Mapped[Optional[List[dict]]] = mapped_column(JSON, nullable=True)
+    # Persists multi-step checkout state across requests.
+    # Schema: {"mode": "SINGLE_PRODUCT"|"CART", "step": "awaiting_size"|"awaiting_address"|"awaiting_confirmation",
+    #          "resolved_product_id": str|null, "resolved_variant_id": str|null,
+    #          "quantity": int, "address_id": str|null, "summary": {...}}
+    checkout_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     cart_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("carts.id", ondelete="SET NULL"),

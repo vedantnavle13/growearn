@@ -37,6 +37,16 @@ class AgentChatResponse(BaseModel):
     cart_updated: bool = False
     product_detail: Optional[Dict[str, Any]] = None
     cart_summary: Optional[Dict[str, Any]] = None
+    # Checkout summary shown to user before confirmation.
+    # Contains: product(s), variant, quantity, unit_price, subtotal, address, total.
+    # Does NOT contain Razorpay fields (payment not yet integrated).
+    checkout_summary: Optional[Dict[str, Any]] = None
+    # Populated when the agent is mid-checkout flow (e.g. waiting for size or address)
+    checkout_state: Optional[Dict[str, Any]] = None
+    # True when the product has multiple variants and user hasn't specified one yet
+    needs_variant_selection: bool = False
+    # Available variants to select from (populated when needs_variant_selection=True)
+    available_variants: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentToolSearchInput(BaseModel):
@@ -58,3 +68,25 @@ class AgentToolAddToCartInput(BaseModel):
     product_id: Optional[uuid.UUID] = Field(None, description="Product UUID (alternative to reference_position)")
     variant_id: Optional[uuid.UUID] = Field(None, description="Product variant UUID (required if using product_id)")
     quantity: int = Field(default=1, ge=1, le=99)
+
+
+class AgentToolCheckoutSingleProductInput(BaseModel):
+    """Input for checkout_single_product tool."""
+    
+    reference_position: Optional[int] = Field(None, ge=1, le=50, description="1-based position in last search results")
+    product_id: Optional[str] = Field(None, description="Explicit product UUID (alternative to reference_position)")
+    quantity: int = Field(default=1, ge=1, le=99)
+    size: Optional[str] = Field(None, description="Size/variant selection (e.g. 'L', 'M', 'XL')")
+    address_hint: Optional[str] = Field(None, description="Address hint: 'default', 'home', 'office', '2', etc.")
+
+
+class AgentToolCheckoutCartInput(BaseModel):
+    """Input for checkout_cart tool."""
+    
+    address_hint: Optional[str] = Field(None, description="Address hint: 'default', 'home', 'office', '2', etc.")
+
+
+class AgentToolConfirmCheckoutInput(BaseModel):
+    """Input for confirm_checkout tool - final confirmation step."""
+    
+    confirm: bool = Field(..., description="True = user confirmed, proceed to create order")

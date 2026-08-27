@@ -123,9 +123,9 @@ class TestCommerceIntentSchema:
 class TestIntentParserUnit:
     @pytest.fixture
     def mock_parser(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "fake_test_api_key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "fake_test_api_key", "LLM_PROVIDER": "gemini"}):
             with patch("google.genai.Client"):
-                parser = IntentParser(api_key="fake_test_api_key")
+                parser = IntentParser(api_key="fake_test_api_key", provider="gemini")
                 return parser
 
     def test_clothing_intent_extraction(self, mock_parser):

@@ -26,6 +26,12 @@ from app.schemas.agent import (
     AgentToolGetProductInput,
     AgentToolAddToCartInput,
 )
+from app.schemas.checkout import (
+    CheckoutRequest,
+    CheckoutResponse,
+    PaymentVerificationRequest,
+    PaymentVerificationResponse,
+)
 
 __all__ = [
     "MerchantProductInput",
@@ -50,4 +56,8 @@ __all__ = [
     "AgentToolSearchInput",
     "AgentToolGetProductInput",
     "AgentToolAddToCartInput",
+    "CheckoutRequest",
+    "CheckoutResponse",
+    "PaymentVerificationRequest",
+    "PaymentVerificationResponse",
 ]

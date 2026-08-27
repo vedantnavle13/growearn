@@ -2,7 +2,7 @@ import uuid
 from decimal import Decimal
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
-from sqlalchemy import String, Integer, Numeric, ForeignKey, DateTime, func, Enum as SQLEnum
+from sqlalchemy import String, Integer, Numeric, ForeignKey, DateTime, func, Enum as SQLEnum, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from app.models.customer import Customer
     from app.models.cart import Cart
     from app.models.product import ProductVariant
+    from app.models.customer_address import CustomerAddress
 
 
 class Order(Base):
@@ -62,10 +63,31 @@ class Order(Base):
         nullable=False
     )
 
+    # -----------------------------------------------------------------------
+    # Shipping address snapshot
+    # These fields are COPIED from CustomerAddress at order-creation time.
+    # They are intentionally denormalized so that historical orders remain
+    # correct even if the customer later edits or deletes their saved address.
+    # -----------------------------------------------------------------------
+    customer_address_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer_addresses.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    shipping_recipient_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    shipping_address_line_1: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    shipping_address_line_2: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    shipping_city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    shipping_state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    shipping_postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    shipping_country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     # Relationships
     merchant: Mapped["Merchant"] = relationship("Merchant", back_populates="orders")
     customer: Mapped["Customer"] = relationship("Customer", back_populates="orders")
     cart: Mapped[Optional["Cart"]] = relationship("Cart", back_populates="orders")
+    customer_address: Mapped[Optional["CustomerAddress"]] = relationship("CustomerAddress")
     items: Mapped[List["OrderItem"]] = relationship(
         "OrderItem",
         back_populates="order",

@@ -6,10 +6,12 @@ POST /api/agent/chat - Conversational shopping with tool orchestration.
 
 import logging
 import uuid
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.merchant_context import MerchantContext, get_merchant_context
 from app.db.database import get_db
 from app.models.customer import Customer
@@ -24,11 +26,12 @@ router = APIRouter(prefix="/api/agent", tags=["Agent"])
 # ---------------------------------------------------------------------------
 # Development/Testing: Customer context resolution
 # In production, this would come from authentication (JWT, session, etc.)
-# For MVP, we support an optional X-Customer-Id header for testing.
+# Supports X-Customer-Id header, customer_id query param, and dev fallback.
 # ---------------------------------------------------------------------------
 
 def get_customer_context(
-    x_customer_id: str | None = None,  # Header alias will be set in Depends
+    x_customer_id: Optional[str] = Header(None, alias="X-Customer-Id", description="Customer UUID header"),
+    customer_id: Optional[str] = Query(None, description="Customer UUID query parameter"),
     merchant_context: MerchantContext = Depends(get_merchant_context),
     db: Session = Depends(get_db),
 ) -> Customer | None:
@@ -36,34 +39,41 @@ def get_customer_context(
     Resolve customer context for the request.
     
     Resolution order:
-    1. HTTP Header 'X-Customer-Id' (for logged-in users)
-    2. None (guest user - no cart access for MVP)
-    
-    Returns None for guest users. In production, replace with auth.
+    1. HTTP Header 'X-Customer-Id'
+    2. Query parameter 'customer_id'
+    3. Demo/Development Fallback: Primary active customer for merchant (if DEBUG is enabled)
     """
-    if not x_customer_id:
-        return None
+    target_id_str = x_customer_id or customer_id
+    if target_id_str:
+        try:
+            customer_uuid = uuid.UUID(str(target_id_str).strip())
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid customer ID format: '{target_id_str}'. Must be a valid UUID.",
+            )
 
-    try:
-        customer_uuid = uuid.UUID(str(x_customer_id).strip())
-    except (ValueError, AttributeError):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid customer ID format: '{x_customer_id}'. Must be a valid UUID.",
-        )
+        customer = db.query(Customer).filter(
+            Customer.id == customer_uuid,
+            Customer.merchant_id == merchant_context.merchant_id,
+        ).first()
 
-    customer = db.query(Customer).filter(
-        Customer.id == customer_uuid,
-        Customer.merchant_id == merchant_context.merchant_id,
-    ).first()
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Customer with ID '{customer_uuid}' not found in this merchant.",
+            )
+        return customer
 
-    if not customer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Customer with ID '{customer_uuid}' not found in this merchant.",
-        )
+    # Development / Demo mode fallback: find primary customer for this merchant
+    if getattr(settings, "DEBUG", False):
+        fallback_customer = db.query(Customer).filter(
+            Customer.merchant_id == merchant_context.merchant_id
+        ).order_by(Customer.created_at.asc()).first()
+        if fallback_customer:
+            return fallback_customer
 
-    return customer
+    return None
 
 
 @router.post(
@@ -115,6 +125,12 @@ async def chat(
         ) from e
     except Exception as e:
         logger.error(f"Agent chat error: {e}", exc_info=True)
+        err_msg = str(e)
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower() or "rate limit" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="AI service quota / rate limit reached. Please retry in a few moments.",
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Agent processing failed. Please try again.",

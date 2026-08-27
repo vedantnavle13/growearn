@@ -11,6 +11,7 @@ import time
 from typing import Optional
 from google import genai
 from google.genai import types
+from huggingface_hub import InferenceClient
 from pydantic import ValidationError
 
 from app.core.config import settings
@@ -73,56 +74,228 @@ Strict Rules:
 """
 
 
+def _clean_json_text(text: str) -> str:
+    """Extract and clean raw JSON string from potentially markdown-wrapped LLM outputs."""
+    if not text:
+        return ""
+    text = text.strip()
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1].strip()
+    return text
+
+
 class IntentParser:
     """
     Parses natural language commerce search queries into structured CommerceIntent models.
+    Supports both Hugging Face Inference API and Google Gemini providers.
     """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
-        self.api_key = api_key or settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "GEMINI_API_KEY is not configured. "
-                "Please set GEMINI_API_KEY in your environment or .env file."
-            )
+        hf_token = (
+            getattr(settings, "HF_TOKEN", None)
+            or os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+            or os.getenv("HUGGINGFACE_API_KEY")
+            or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        )
+        gemini_key = (
+            getattr(settings, "GEMINI_API_KEY", None)
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
 
-        self.model = model or getattr(settings, "GEMINI_INTENT_MODEL", None) or os.getenv("GEMINI_INTENT_MODEL", "gemini-3.6-flash")
+        if provider:
+            self.provider = provider.lower()
+        elif api_key and (api_key.startswith("hf_")):
+            self.provider = "huggingface"
+        elif api_key and (api_key.startswith("AIza") or api_key.startswith("AQ.")):
+            self.provider = "gemini"
+        elif os.getenv("LLM_PROVIDER"):
+            self.provider = os.getenv("LLM_PROVIDER").lower()
+        else:
+            self.provider = (
+                getattr(settings, "LLM_PROVIDER", None)
+                or "huggingface"
+            ).lower()
 
-        try:
-            self.client = genai.Client(api_key=self.api_key)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to initialize Google GenAI Client: {exc}") from exc
+        if not provider:
+            explicit_env_provider = os.getenv("LLM_PROVIDER")
+            if not explicit_env_provider:
+                if self.provider == "huggingface" and not hf_token and gemini_key:
+                    self.provider = "gemini"
+                elif self.provider == "gemini" and not gemini_key and hf_token:
+                    self.provider = "huggingface"
+
+        if self.provider == "gemini":
+            self.api_key = api_key or gemini_key
+            if not self.api_key:
+                raise ValueError(
+                    "GEMINI_API_KEY is not configured. "
+                    "Please set GEMINI_API_KEY in your environment or .env file."
+                )
+            self.model = model or getattr(settings, "GEMINI_INTENT_MODEL", None) or os.getenv("GEMINI_INTENT_MODEL", "gemini-2.5-flash")
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to initialize Google GenAI Client: {exc}") from exc
+            self.hf_client = None
+
+        else:
+            # Default to Hugging Face provider
+            self.provider = "huggingface"
+            self.api_key = api_key or hf_token
+            if not self.api_key:
+                raise ValueError(
+                    "HF_TOKEN is not configured. "
+                    "Please set HF_TOKEN or HUGGINGFACEHUB_ACCESS_TOKEN in your environment or .env file."
+                )
+
+            self.model = model or getattr(settings, "HF_MODEL", None) or os.getenv("HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+            try:
+                self.hf_client = InferenceClient(
+                    token=self.api_key,
+                    base_url=getattr(settings, "HF_API_BASE", None),
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to initialize Hugging Face InferenceClient: {exc}") from exc
+            self.client = None
 
     def parse(self, text: str) -> CommerceIntent:
         """
-        Parses raw customer text into a validated CommerceIntent.
-
-        Args:
-            text (str): Natural language user input.
-
-        Returns:
-            CommerceIntent: Validated structured commerce intent.
-
-        Raises:
-            ValueError: If input text is empty or invalid.
-            RuntimeError: If the Gemini LLM API call fails.
-            ValidationError: If the returned JSON does not conform to CommerceIntent rules.
+        Parses raw customer text into a validated CommerceIntent with automatic cross-provider fallback.
         """
         if not text or not isinstance(text, str) or not text.strip():
             raise ValueError("Input text for intent parsing must be a non-empty string.")
 
-        import time
+        provider = getattr(self, "provider", None)
+        if not provider:
+            if getattr(self, "client", None) is not None:
+                provider = "gemini"
+            elif getattr(self, "hf_client", None) is not None:
+                provider = "huggingface"
+            else:
+                provider = getattr(settings, "LLM_PROVIDER", "huggingface").lower()
 
-        user_prompt = f"Customer request: {text.strip()}"
-        max_retries = 4
+        if provider == "gemini":
+            try:
+                return self._parse_gemini(text.strip())
+            except Exception as gem_exc:
+                # Check if Hugging Face fallback is available
+                hf_token = (
+                    getattr(settings, "HF_TOKEN", None)
+                    or os.getenv("HF_TOKEN")
+                    or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+                    or os.getenv("HUGGINGFACE_API_KEY")
+                )
+                if hf_token:
+                    try:
+                        if not self.hf_client:
+                            self.hf_client = InferenceClient(
+                                token=hf_token,
+                                base_url=getattr(settings, "HF_API_BASE", None),
+                            )
+                        return self._parse_huggingface(text.strip())
+                    except Exception:
+                        pass
+                raise gem_exc
+        else:
+            try:
+                return self._parse_huggingface(text.strip())
+            except Exception as hf_exc:
+                # Check if Gemini fallback is available
+                gemini_key = (
+                    getattr(settings, "GEMINI_API_KEY", None)
+                    or os.getenv("GEMINI_API_KEY")
+                    or os.getenv("GOOGLE_API_KEY")
+                )
+                if gemini_key:
+                    try:
+                        if not self.client:
+                            self.client = genai.Client(api_key=gemini_key)
+                        return self._parse_gemini(text.strip())
+                    except Exception:
+                        pass
+                raise hf_exc
+
+    def _parse_huggingface(self, text: str) -> CommerceIntent:
+        """Parse commerce intent using Hugging Face Inference API."""
+        user_prompt = f"Customer request: {text}"
+        candidate_models = [self.model, "Qwen/Qwen2.5-72B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3"]
+        candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
+
+        max_retries = 3
         last_exc = None
+        raw_response_text = None
 
-        candidate_models = [self.model, "gemini-3.5-flash", "gemini-3.5-flash-lite"]
-        candidate_models = list(dict.fromkeys(candidate_models))
+        for model_name in candidate_models:
+            for attempt in range(max_retries):
+                try:
+                    response = self.hf_client.chat_completion(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_INSTRUCTION},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.0,
+                        max_tokens=600,
+                    )
+                    if response and response.choices and response.choices[0].message:
+                        raw_response_text = response.choices[0].message.content
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc)
+                    if "429" in err_str or "Rate limit" in err_str or "temporarily unavailable" in err_str:
+                        if model_name != candidate_models[-1]:
+                            break
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"Hugging Face intent extraction call failed: {exc}") from exc
+
+            if last_exc is None and raw_response_text:
+                break
+
+        if last_exc and not raw_response_text:
+            raise RuntimeError(f"Hugging Face intent extraction call failed: {last_exc}") from last_exc
+
+        if not raw_response_text:
+            raise RuntimeError("Hugging Face model returned an empty response.")
+
+        clean_json = _clean_json_text(raw_response_text)
+
+        # Validate structured output into CommerceIntent Pydantic model
+        try:
+            return CommerceIntent.model_validate_json(clean_json)
+        except ValidationError as val_err:
+            raise ValidationError.from_exception_data(
+                title="CommerceIntentValidation",
+                line_errors=val_err.errors(),
+            ) from val_err
+        except Exception as parse_err:
+            raise ValueError(f"Failed to parse model output into CommerceIntent: {parse_err}") from parse_err
+
+    def _parse_gemini(self, text: str) -> CommerceIntent:
+        """Parse commerce intent using Google Gemini API."""
+        user_prompt = f"Customer request: {text}"
+        max_retries = 3
+        last_exc = None
+        response = None
+
+        primary_model = self.model or getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-2.5-flash"
+        candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+        candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
         for model_name in candidate_models:
             for attempt in range(max_retries):
@@ -144,13 +317,12 @@ class IntentParser:
                 except Exception as exc:
                     last_exc = exc
                     err_str = str(exc)
-                    if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str):
-                        # Switch to fallback model immediately
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                         if model_name != candidate_models[-1]:
                             break
                         if attempt < max_retries - 1:
-                            delay_match = re.search(r'retry in (\d+(?:\.\d+)?)s', err_str)
-                            wait_sec = float(delay_match.group(1)) + 1.5 if delay_match else (5.0 * (attempt + 1))
+                            delay_match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str)
+                            wait_sec = float(delay_match.group(1)) + 1.5 if delay_match else (3.0 * (attempt + 1))
                             time.sleep(wait_sec)
                             continue
                     raise RuntimeError(f"Gemini intent extraction call failed: {exc}") from exc
@@ -164,9 +336,11 @@ class IntentParser:
         if not response or not response.text:
             raise RuntimeError("Gemini model returned an empty response.")
 
+        clean_json = _clean_json_text(response.text)
+
         # Validate structured output into CommerceIntent Pydantic model
         try:
-            return CommerceIntent.model_validate_json(response.text)
+            return CommerceIntent.model_validate_json(clean_json)
         except ValidationError as val_err:
             raise ValidationError.from_exception_data(
                 title="CommerceIntentValidation",
@@ -174,3 +348,4 @@ class IntentParser:
             ) from val_err
         except Exception as parse_err:
             raise ValueError(f"Failed to parse model output into CommerceIntent: {parse_err}") from parse_err
+
