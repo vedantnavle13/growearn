@@ -23,14 +23,44 @@ Your task is to analyze natural language customer search queries across ANY prod
 Output JSON Schema:
 {
   "query": string (Required. The core semantic search query expressing the product desired, stripped of conversational preambles/pleasantries like 'Hey, can you please find me' or 'Looking for'. Example: 'simple black shirt for a wedding'),
-  "category": string or null (The product category, e.g. 'Shirts', 'Laptops', 'Stationery', 'Shoes', 'Dresses', or null if unspecified/ambiguous),
+  "category": string or null (EXACT product category, e.g. 'Shirts', 'Laptops', 'Stationery', 'Jeans', 'Dresses', or null if unspecified/ambiguous. ONLY use when user specifies a specific category that likely exists in the database.),
+  "category_concept": string or null (Broad semantic category CONCEPT, e.g. 'clothing', 'electronics', 'footwear', 'stationery', 'furniture', or null. Use for broad user terms like 'clothes', 'electronics', 'shoes', 'things' that map to MULTIPLE database categories.),
   "brand": string or null (Explicit brand mentioned by customer, or null),
   "min_price": number or null (Minimum price boundary in currency units if specified, or null),
   "max_price": number or null (Maximum price boundary in currency units if specified, or null),
   "color": string or null (Requested color or finish, or null),
   "size": string or null (Requested size, or null),
-  "attributes": object (JSON key-value dictionary containing category-specific constraints/preferences present in or strongly implied by the request. E.g. {"occasion": "wedding", "style": "simple"} for clothing, {"weight": "lightweight", "ram": "16GB", "use_case": "programming"} for electronics, {"type": "mechanical", "use_case": "drawing"} for stationery)
+  "attributes": object (JSON key-value dictionary containing category-specific constraints/preferences present in or strongly implied by the request. E.g. {"occasion": "wedding", "style": "simple"} for clothing, {"weight": "lightweight", "ram": "16GB", "use_case": "programming"} for electronics, {"type": "mechanical", "use_case": "drawing"} for stationery),
+  "requested_limit": integer or null (User-specified result count limit. Extract from phrases like "top 5", "5 items", "give me 5", "show me five", "first 3", "show 10", "top 1". Return null if no count specified. Must be >= 1. Maximum allowed is 50 - if user requests more, clamp to 50.)
 }
+
+CRITICAL DISTINCTION - category vs category_concept:
+
+EXACT CATEGORY (category field):
+- User says "black shirt" → category: "Shirts", category_concept: null
+- User says "wedding dress" → category: "Dresses", category_concept: null  
+- User says "gaming laptop" → category: "Laptops", category_concept: null
+- User says "running shoes" → category: "Shoes", category_concept: null
+
+BROAD CATEGORY CONCEPT (category_concept field):
+- User says "black clothes" → category: null, category_concept: "clothing"
+- User says "electronics under 50000" → category: null, category_concept: "electronics"
+- User says "footwear for running" → category: null, category_concept: "footwear"
+- User says "something nice" → category: null, category_concept: null (too vague)
+
+AMBIGUOUS - use category_concept when uncertain:
+- "show me clothes" → category_concept: "clothing"
+- "I need electronics" → category_concept: "electronics"
+
+REQUESTED LIMIT EXAMPLES:
+- "top 5 black shirts" → requested_limit: 5
+- "give me 3 black shirts" → requested_limit: 3
+- "show me 7 shoes" → requested_limit: 7
+- "show me 1 black shirt" → requested_limit: 1
+- "show me five black shirts" → requested_limit: 5
+- "first 3 black shirts" → requested_limit: 3
+- "show me black shirts" → requested_limit: null
+- "I need a black shirt" → requested_limit: null
 
 Strict Rules:
 1. Support ANY commerce category (stationery, electronics, clothing, cosmetics, furniture, books, etc.).
@@ -38,6 +68,8 @@ Strict Rules:
 3. DO NOT assign clothing-specific attributes (like style, fit, occasion) to non-clothing products like laptops or pencils.
 4. DO NOT generate SQL, database queries, or product IDs.
 5. Return ONLY a valid JSON object matching the schema above.
+6. NEVER use category_concept for specific categories like "Shirts" or "Laptops" - those go in category field.
+7. Extract requested_limit from natural language count expressions. If no count is specified, set requested_limit to null. Do NOT hallucinate a count.
 """
 
 

@@ -58,6 +58,19 @@ class TestCommerceIntentSchema:
         assert intent.min_price is None
         assert intent.color == "black"
         assert intent.attributes == {"occasion": "wedding"}
+        assert intent.requested_limit is None
+
+    def test_valid_intent_with_requested_limit(self):
+        intent = CommerceIntent(
+            query="black shirts",
+            category="Shirts",
+            color="black",
+            requested_limit=5,
+        )
+        assert intent.query == "black shirts"
+        assert intent.category == "Shirts"
+        assert intent.color == "black"
+        assert intent.requested_limit == 5
 
     def test_empty_query_rejected(self):
         with pytest.raises(ValidationError):
@@ -82,6 +95,25 @@ class TestCommerceIntentSchema:
 
         with pytest.raises(ValidationError):
             CommerceIntent(query="shoes", max_price=Decimal("-50"))
+
+    def test_requested_limit_validation(self):
+        # Test that requested_limit must be >= 1
+        with pytest.raises(ValidationError):
+            CommerceIntent(query="shirts", requested_limit=0)
+
+        with pytest.raises(ValidationError):
+            CommerceIntent(query="shirts", requested_limit=-1)
+
+        # Test that requested_limit must be <= 50 (MAX_SEARCH_LIMIT)
+        with pytest.raises(ValidationError):
+            CommerceIntent(query="shirts", requested_limit=51)
+
+        # Valid limits
+        intent = CommerceIntent(query="shirts", requested_limit=1)
+        assert intent.requested_limit == 1
+
+        intent = CommerceIntent(query="shirts", requested_limit=50)
+        assert intent.requested_limit == 50
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +250,7 @@ class TestIntentParserUnit:
             "color": "black",
             "size": None,
             "attributes": {"use_case": "running"},
+            "requested_limit": None,
         }
 
         mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
@@ -228,6 +261,143 @@ class TestIntentParserUnit:
         assert intent.max_price is None
         assert intent.min_price is None
         assert intent.color == "black"
+        assert intent.requested_limit is None
+
+    def test_requested_limit_extraction_top_n(self, mock_parser):
+        raw_text = "show me top 5 black shirts"
+        mock_payload = {
+            "query": "black shirts",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": 5,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.query == "black shirts"
+        assert intent.category == "Shirts"
+        assert intent.color == "black"
+        assert intent.requested_limit == 5
+
+    def test_requested_limit_extraction_give_me_n(self, mock_parser):
+        raw_text = "give me 3 black shirts"
+        mock_payload = {
+            "query": "black shirts",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": 3,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit == 3
+
+    def test_requested_limit_extraction_show_n(self, mock_parser):
+        raw_text = "show me 7 shoes"
+        mock_payload = {
+            "query": "shoes",
+            "category": "Shoes",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": None,
+            "size": None,
+            "attributes": {},
+            "requested_limit": 7,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit == 7
+
+    def test_requested_limit_extraction_top_1(self, mock_parser):
+        raw_text = "show me top 1 black shirt"
+        mock_payload = {
+            "query": "black shirt",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": 1,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit == 1
+
+    def test_requested_limit_extraction_words(self, mock_parser):
+        raw_text = "show me five black shirts"
+        mock_payload = {
+            "query": "black shirts",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": 5,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit == 5
+
+    def test_requested_limit_extraction_first_n(self, mock_parser):
+        raw_text = "first 3 black shirts"
+        mock_payload = {
+            "query": "black shirts",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": 3,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit == 3
+
+    def test_no_requested_limit_when_not_specified(self, mock_parser):
+        raw_text = "show me black shirts"
+        mock_payload = {
+            "query": "black shirts",
+            "category": "Shirts",
+            "brand": None,
+            "min_price": None,
+            "max_price": None,
+            "color": "black",
+            "size": None,
+            "attributes": {},
+            "requested_limit": None,
+        }
+
+        mock_parser.client.models.generate_content.return_value = _mock_generate_content_response(mock_payload)
+        intent = mock_parser.parse(raw_text)
+
+        assert intent.requested_limit is None
 
     def test_empty_string_input_rejected(self, mock_parser):
         with pytest.raises(ValueError) as exc_info:

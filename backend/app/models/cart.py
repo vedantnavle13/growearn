@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from app.models.customer import Customer
     from app.models.product import ProductVariant
     from app.models.order import Order
+    from app.models.agent_session import AgentSession
 
 
 class Cart(Base):
@@ -58,6 +59,11 @@ class Cart(Base):
     orders: Mapped[List["Order"]] = relationship(
         "Order",
         back_populates="cart"
+    )
+    agent_sessions: Mapped[List["AgentSession"]] = relationship(
+        "AgentSession",
+        back_populates="cart",
+        cascade="all, delete-orphan"
     )
 
 

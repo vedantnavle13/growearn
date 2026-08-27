@@ -5,6 +5,7 @@ from app.models.cart import Cart, CartItem
 from app.models.order import Order, OrderItem, Payment
 from app.models.event import Event
 from app.models.agent_action import AgentAction
+from app.models.agent_session import AgentSession
 from app.models.enums import CartStatus, OrderStatus, PaymentStatus, AgentActionStatus
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "Payment",
     "Event",
     "AgentAction",
+    "AgentSession",
     "CartStatus",
     "OrderStatus",
     "PaymentStatus",

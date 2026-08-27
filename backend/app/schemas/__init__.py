@@ -18,6 +18,14 @@ from app.schemas.product import (
     IntentSearchResult,
     VariantSummary,
 )
+from app.schemas.agent import (
+    AgentChatRequest,
+    AgentChatResponse,
+    AgentProductSummary,
+    AgentToolSearchInput,
+    AgentToolGetProductInput,
+    AgentToolAddToCartInput,
+)
 
 __all__ = [
     "MerchantProductInput",
@@ -36,4 +44,10 @@ __all__ = [
     "IntentSearchResponse",
     "IntentSearchResult",
     "VariantSummary",
+    "AgentChatRequest",
+    "AgentChatResponse",
+    "AgentProductSummary",
+    "AgentToolSearchInput",
+    "AgentToolGetProductInput",
+    "AgentToolAddToCartInput",
 ]

@@ -15,7 +15,10 @@ class CommerceIntent(BaseModel):
     
     Fields:
     - query: Clean semantic search query expressing the core user product search intent (without conversational filler).
-    - category: Inferred product category (e.g., Shirts, Laptops, Stationery), or null if not specified/confident.
+    - category: Inferred EXACT product category (e.g., Shirts, Laptops, Stationery), or null if not specified/confident.
+                Use ONLY when user specifies a specific category that likely exists in the database.
+    - category_concept: Broad semantic category concept (e.g., clothing, electronics, footwear), or null.
+                        Use for broad user terms like "clothes", "electronics", "shoes" that map to multiple DB categories.
     - brand: Explicitly requested brand name, or null.
     - min_price: Optional minimum price filter (inclusive, >= 0).
     - max_price: Optional maximum price filter (inclusive, >= 0).
@@ -30,7 +33,11 @@ class CommerceIntent(BaseModel):
     )
     category: Optional[str] = Field(
         default=None,
-        description="Broad or specific product category (e.g. Shirts, Laptops, Stationery), or null",
+        description="EXACT product category (e.g. Shirts, Laptops, Stationery), or null. Only use when user specifies a specific category.",
+    )
+    category_concept: Optional[str] = Field(
+        default=None,
+        description="Broad semantic category concept (e.g. clothing, electronics, footwear), or null. Use for broad terms like 'clothes', 'electronics', 'shoes'.",
     )
     brand: Optional[str] = Field(
         default=None,
@@ -58,6 +65,12 @@ class CommerceIntent(BaseModel):
         default_factory=dict,
         description="Category-specific key-value constraints actually present in or strongly implied by the request",
     )
+    requested_limit: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description="User-specified result count limit (e.g., 'top 5', 'show me 3'). Null if not specified.",
+    )
 
     @field_validator("query")
     @classmethod
@@ -71,6 +84,13 @@ class CommerceIntent(BaseModel):
     def validate_attributes_dict(cls, v: Any) -> Dict[str, Any]:
         if not isinstance(v, dict):
             raise ValueError("Attributes must be a dictionary")
+        return v
+
+    @field_validator("category_concept")
+    @classmethod
+    def validate_category_concept(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return v.strip().lower()
         return v
 
     @model_validator(mode="after")
@@ -106,6 +126,7 @@ class IntentParseRequest(BaseModel):
 
 
 import uuid
+from app.core.config import settings
 
 
 class IntentSearchRequest(BaseModel):
@@ -126,10 +147,10 @@ class IntentSearchRequest(BaseModel):
         description="Optional external customer ID from merchant system for customer personalization",
     )
     limit: int = Field(
-        default=10,
+        default=settings.DEFAULT_SEARCH_LIMIT,
         ge=1,
-        le=50,
-        description="Maximum number of results (default 10, max 50)",
+        le=settings.MAX_SEARCH_LIMIT,
+        description=f"Maximum number of results (default {settings.DEFAULT_SEARCH_LIMIT}, max {settings.MAX_SEARCH_LIMIT})",
     )
 
     @field_validator("query")

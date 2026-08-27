@@ -36,6 +36,7 @@ from app.retrieval.ranker import (
     SEMANTIC_WEIGHT,
     KEYWORD_WEIGHT,
     ATTRIBUTE_WEIGHT,
+    CONCEPT_WEIGHT,
     PERSONALIZATION_WEIGHT,
 )
 
@@ -166,11 +167,12 @@ class TestCustomerPreferenceService:
 # ---------------------------------------------------------------------------
 class TestPersonalizationScoringMath:
     def test_weights_configuration_constants(self):
-        assert SEMANTIC_WEIGHT == 0.50
-        assert KEYWORD_WEIGHT == 0.20
+        assert SEMANTIC_WEIGHT == 0.45
+        assert KEYWORD_WEIGHT == 0.15
         assert ATTRIBUTE_WEIGHT == 0.15
+        assert CONCEPT_WEIGHT == 0.10
         assert PERSONALIZATION_WEIGHT == 0.15
-        assert round(SEMANTIC_WEIGHT + KEYWORD_WEIGHT + ATTRIBUTE_WEIGHT + PERSONALIZATION_WEIGHT, 2) == 1.00
+        assert round(SEMANTIC_WEIGHT + KEYWORD_WEIGHT + ATTRIBUTE_WEIGHT + CONCEPT_WEIGHT + PERSONALIZATION_WEIGHT, 2) == 1.00
 
     def test_test_1_cold_start_neutrality(self):
         """Test 1: New customer with no history -> personalization is neutral (0.0)."""

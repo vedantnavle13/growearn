@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 1536
     GEMINI_INTENT_MODEL: str = "gemini-3.6-flash"
 
+    # Search limits
+    DEFAULT_SEARCH_LIMIT: int = 10
+    MAX_SEARCH_LIMIT: int = 50
+
     @property
     def sync_database_url(self) -> str:
         """Returns the active database URL or constructs one from components."""

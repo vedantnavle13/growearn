@@ -154,8 +154,11 @@ class TestIntentProductSearchEndpoint:
         assert len(data["results"]) == 1
         result = data["results"][0]
         assert result["title"] == "Urban Minimal Cotton Slub Formal Shirt"
-        # Composite score (Step 13 weights): 0.50 * 0.885 (semantic) + 0.20 * 0.5 (keyword) + 0.15 * 0 (attr) + 0.15 * 0 (pref) = 0.5425
-        assert result["similarity_score"] == 0.5425
+        # Composite score (Step 15 weights): 
+        # SEMANTIC(0.45)*0.885 + KEYWORD(0.15)*0.5 + ATTRIBUTE(0.15)*0 + CONCEPT(0.10)*0 + PERSONALIZATION(0.15)*0
+        # = 0.39825 + 0.075 + 0 + 0 + 0 = 0.47325 ≈ 0.4733
+        # Note: concept_score is 0 because test DB has no categories loaded for concept mapping
+        assert abs(result["similarity_score"] - 0.4733) < 0.001
 
         # Verify privacy: no cost_price or embeddings
         assert "cost_price" not in result

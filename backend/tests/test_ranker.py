@@ -32,6 +32,7 @@ from app.retrieval.ranker import (
     SEMANTIC_WEIGHT,
     KEYWORD_WEIGHT,
     ATTRIBUTE_WEIGHT,
+    CONCEPT_WEIGHT,
     PERSONALIZATION_WEIGHT,
 )
 
@@ -74,9 +75,10 @@ class TestExactScoringMath:
             personalization_weight=0.00,
         )
 
-        assert SEMANTIC_WEIGHT == 0.50
-        assert KEYWORD_WEIGHT == 0.20
+        assert SEMANTIC_WEIGHT == 0.45
+        assert KEYWORD_WEIGHT == 0.15
         assert ATTRIBUTE_WEIGHT == 0.15
+        assert CONCEPT_WEIGHT == 0.10
         assert PERSONALIZATION_WEIGHT == 0.15
 
         prod_a = _make_mock_product("Product A")
@@ -95,6 +97,7 @@ class TestExactScoringMath:
             semantic_score=0.70,
             keyword_score=0.90,
             attribute_score=1.0,
+            concept_score=0.0,
             personalization_score=0.0,
             final_score=round(score_a, 4),
         )
@@ -103,6 +106,7 @@ class TestExactScoringMath:
             semantic_score=0.90,
             keyword_score=0.20,
             attribute_score=0.0,
+            concept_score=0.0,
             personalization_score=0.0,
             final_score=round(score_b, 4),
         )

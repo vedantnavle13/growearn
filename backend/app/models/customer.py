@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from app.models.order import Order
     from app.models.event import Event
     from app.models.agent_action import AgentAction
+    from app.models.agent_session import AgentSession
 
 
 class Customer(Base):
@@ -68,6 +69,11 @@ class Customer(Base):
     )
     agent_actions: Mapped[List["AgentAction"]] = relationship(
         "AgentAction",
+        back_populates="customer",
+        cascade="all, delete-orphan"
+    )
+    agent_sessions: Mapped[List["AgentSession"]] = relationship(
+        "AgentSession",
         back_populates="customer",
         cascade="all, delete-orphan"
     )

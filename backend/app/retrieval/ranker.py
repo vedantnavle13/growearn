@@ -5,12 +5,14 @@ Signals:
 1. Semantic Similarity: pgvector cosine similarity score from vector retrieval.
 2. Keyword Relevance: Token overlap between clean query terms and product text fields.
 3. Dynamic Attribute Relevance: Intent attributes matched against product JSONB attributes.
-4. Personalization Score: Historical customer preference alignment (categories, brands, colors, price, prior orders).
+4. Category Concept Relevance: Product category alignment with broad user concepts (clothing, electronics, etc.).
+5. Personalization Score: Historical customer preference alignment (categories, brands, colors, price, prior orders).
 
 Final Score Formula:
     final_score = (SEMANTIC_WEIGHT * semantic_score)
                 + (KEYWORD_WEIGHT * keyword_score)
                 + (ATTRIBUTE_WEIGHT * attribute_score)
+                + (CONCEPT_WEIGHT * concept_score)
                 + (PERSONALIZATION_WEIGHT * personalization_score)
 
 Ranking occurs strictly AFTER hard constraints have eliminated non-qualifying products.
@@ -29,9 +31,10 @@ from app.schemas.preference import CustomerPreferences
 # ---------------------------------------------------------------------------
 # Default Configurable Weights
 # ---------------------------------------------------------------------------
-SEMANTIC_WEIGHT: float = 0.50
-KEYWORD_WEIGHT: float = 0.20
+SEMANTIC_WEIGHT: float = 0.45
+KEYWORD_WEIGHT: float = 0.15
 ATTRIBUTE_WEIGHT: float = 0.15
+CONCEPT_WEIGHT: float = 0.10
 PERSONALIZATION_WEIGHT: float = 0.15
 
 # Common English stop words ignored in keyword scoring
@@ -52,6 +55,7 @@ class ScoredProduct:
     semantic_score: float
     keyword_score: float
     attribute_score: float
+    concept_score: float
     final_score: float
     personalization_score: float = 0.0
 
@@ -63,6 +67,7 @@ class ScoredProduct:
             "semantic_score": round(self.semantic_score, 4),
             "keyword_score": round(self.keyword_score, 4),
             "attribute_score": round(self.attribute_score, 4),
+            "concept_score": round(self.concept_score, 4),
             "personalization_score": round(self.personalization_score, 4),
             "final_score": round(self.final_score, 4),
         }
@@ -78,11 +83,13 @@ class ProductRanker:
         semantic_weight: float = SEMANTIC_WEIGHT,
         keyword_weight: float = KEYWORD_WEIGHT,
         attribute_weight: float = ATTRIBUTE_WEIGHT,
+        concept_weight: float = CONCEPT_WEIGHT,
         personalization_weight: float = PERSONALIZATION_WEIGHT,
     ) -> None:
         self.semantic_weight = semantic_weight
         self.keyword_weight = keyword_weight
         self.attribute_weight = attribute_weight
+        self.concept_weight = concept_weight
         self.personalization_weight = personalization_weight
 
     def rank(
@@ -90,16 +97,19 @@ class ProductRanker:
         candidates: List[Tuple[Product, float]],
         intent: CommerceIntent,
         preferences: Optional[CustomerPreferences] = None,
+        concept_categories: Optional[List[str]] = None,
         limit: int = 10,
     ) -> List[ScoredProduct]:
         """
         Rank candidate products based on semantic similarity, keyword overlap, attribute alignment,
-        and customer preference signals.
+        category concept alignment, and customer preference signals.
 
         Args:
             candidates: List of (Product, semantic_similarity) tuples from hard-filtered retrieval.
             intent: Structured CommerceIntent containing clean query and dynamic attributes.
             preferences: Optional CustomerPreferences profile derived from customer activity.
+            concept_categories: List of actual database categories that match the user's broad category concept.
+                              Used for concept relevance scoring (e.g., "clothing" -> ["Shirts", "Jeans", "Jackets"]).
             limit: Number of top ranked products to return.
 
         Returns:
@@ -122,14 +132,18 @@ class ProductRanker:
             # 3. Dynamic attribute relevance score
             attribute_score = self._compute_attribute_score(product, intent.attributes)
 
-            # 4. Personalization relevance score
+            # 4. Category concept relevance score
+            concept_score = self._compute_concept_score(product, concept_categories)
+
+            # 5. Personalization relevance score
             personalization_score = self._compute_personalization_score(product, preferences)
 
-            # 5. Composite final score
+            # 6. Composite final score
             final_score = (
                 (self.semantic_weight * semantic_score)
                 + (self.keyword_weight * keyword_score)
                 + (self.attribute_weight * attribute_score)
+                + (self.concept_weight * concept_score)
                 + (self.personalization_weight * personalization_score)
             )
 
@@ -139,6 +153,7 @@ class ProductRanker:
                     semantic_score=round(semantic_score, 4),
                     keyword_score=round(keyword_score, 4),
                     attribute_score=round(attribute_score, 4),
+                    concept_score=round(concept_score, 4),
                     personalization_score=round(personalization_score, 4),
                     final_score=round(final_score, 4),
                 )
@@ -261,6 +276,45 @@ class ProductRanker:
             return 1.0
         elif str_intent in str_prod or str_prod in str_intent:
             return 0.75
+
+        return 0.0
+
+    def _compute_concept_score(
+        self,
+        product: Product,
+        concept_categories: Optional[List[str]],
+    ) -> float:
+        """
+        Compute category concept relevance score.
+        
+        Checks if the product's category matches any of the concept categories
+        (e.g., "clothing" -> ["Shirts", "Jeans", "Jackets"]).
+        
+        Returns a float in [0.0, 1.0].
+        """
+        if not concept_categories:
+            return 0.0
+
+        prod_attrs = product.attributes if isinstance(product.attributes, dict) else {}
+        if not prod_attrs:
+            return 0.0
+
+        prod_cat = prod_attrs.get("category")
+        if not prod_cat:
+            return 0.0
+
+        prod_cat_clean = str(prod_cat).strip()
+
+        # Direct match: product category is in concept categories
+        if prod_cat_clean in concept_categories:
+            return 1.0
+
+        # Fuzzy match: check if any concept category is a substring of product category or vice versa
+        for concept_cat in concept_categories:
+            concept_clean = str(concept_cat).strip().lower()
+            prod_lower = prod_cat_clean.lower()
+            if concept_clean in prod_lower or prod_lower in concept_clean:
+                return 0.75
 
         return 0.0
 
