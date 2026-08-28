@@ -11,12 +11,22 @@ from app.api.checkout import router as checkout_router
 from app.api.payment_verification import router as payment_verification_router
 from app.api.webhook import router as webhook_router
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Growearn - AI Commerce Agent API for SMB Merchants",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Register routers

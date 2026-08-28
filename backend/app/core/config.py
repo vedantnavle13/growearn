@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     EMBEDDING_MODEL: str = "gemini-embedding-2"
     EMBEDDING_DIMENSION: int = 1536
-    GEMINI_INTENT_MODEL: str = "gemini-2.5-flash"
+    GEMINI_INTENT_MODEL: str = "gemini-3.6-flash"
 
     # Search limits
     DEFAULT_SEARCH_LIMIT: int = 10

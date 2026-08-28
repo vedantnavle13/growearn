@@ -27,6 +27,10 @@ from app.services.checkout_service import (
     CustomerMismatchError,
 )
 
+from decimal import Decimal
+from app.models.cart import Cart, CartItem, CartStatus
+from app.models.product import Product, ProductVariant
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["Checkout"])
@@ -73,6 +77,95 @@ def get_customer_context(
             return fallback_customer
 
     return None
+
+
+@router.get(
+    "/cart",
+    summary="Get active cart contents for customer",
+)
+async def get_active_cart(
+    merchant_context: MerchantContext = Depends(get_merchant_context),
+    customer: Customer | None = Depends(get_customer_context),
+    db: Session = Depends(get_db),
+):
+    """Retrieve the current active cart items for the authenticated customer."""
+    if not customer:
+        return {"items": [], "subtotal": 0.0, "item_count": 0}
+
+    cart = db.query(Cart).filter(
+        Cart.customer_id == customer.id,
+        Cart.status == CartStatus.ACTIVE,
+    ).first()
+
+    if not cart or not cart.items:
+        return {"cart_id": str(cart.id) if cart else None, "items": [], "subtotal": 0.0, "item_count": 0}
+
+    items = []
+    subtotal = Decimal("0")
+    for item in cart.items:
+        variant = item.variant
+        if not variant:
+            continue
+        product = variant.product
+        if not product or product.merchant_id != merchant_context.merchant_id:
+            continue
+
+        available = 0
+        if variant.inventory:
+            available = max(0, variant.inventory.quantity - variant.inventory.reserved_quantity)
+
+        line_total = item.price_at_addition * item.quantity
+        subtotal += line_total
+
+        items.append({
+            "id": str(product.id),
+            "cart_item_id": str(item.id),
+            "product_id": str(product.id),
+            "variant_id": str(variant.id),
+            "title": product.title,
+            "price": float(item.price_at_addition),
+            "color": variant.color,
+            "size": variant.size,
+            "quantity": item.quantity,
+            "line_total": float(line_total),
+            "in_stock": available >= item.quantity,
+            "image_url": product.image_url,
+        })
+
+    return {
+        "cart_id": str(cart.id),
+        "items": items,
+        "subtotal": float(subtotal),
+        "item_count": sum(i["quantity"] for i in items),
+    }
+
+
+@router.delete(
+    "/cart/items/{cart_item_id}",
+    summary="Remove an item from cart",
+)
+async def remove_cart_item(
+    cart_item_id: uuid.UUID,
+    merchant_context: MerchantContext = Depends(get_merchant_context),
+    customer: Customer | None = Depends(get_customer_context),
+    db: Session = Depends(get_db),
+):
+    """Remove a specific item from active cart."""
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+
+    item = db.query(CartItem).join(Cart).filter(
+        CartItem.id == cart_item_id,
+        Cart.customer_id == customer.id,
+        Cart.status == CartStatus.ACTIVE,
+    ).first()
+
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cart item not found")
+
+    db.delete(item)
+    db.commit()
+    return {"success": True}
 
 
 @router.post(

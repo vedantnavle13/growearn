@@ -293,8 +293,8 @@ class IntentParser:
         last_exc = None
         response = None
 
-        primary_model = self.model or getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-2.5-flash"
-        candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+        primary_model = self.model or getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-3.6-flash"
+        candidate_models = [primary_model, "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
         candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
         for model_name in candidate_models:

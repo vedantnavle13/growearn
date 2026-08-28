@@ -209,11 +209,45 @@ CONFIRM_CHECKOUT_TOOL = types.FunctionDeclaration(
     ),
 )
 
+REMOVE_FROM_CART_TOOL = types.FunctionDeclaration(
+    name="remove_from_cart",
+    description=(
+        "Remove an item or all items from the customer's active cart. "
+        "Use when user says 'remove the first item from my cart', 'delete item #2', "
+        "'remove the shirt from cart', 'empty my cart', or 'clear my cart'."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "item_position": types.Schema(
+                type=types.Type.INTEGER,
+                minimum=1,
+                maximum=50,
+                description="1-based position of the item in the customer's cart (e.g. 1 for 1st cart item, 2 for 2nd cart item)."
+            ),
+            "product_name": types.Schema(
+                type=types.Type.STRING,
+                description="Product name or keyword to match and remove from cart (e.g. 'shirt', 'pants', 'Oxford')."
+            ),
+            "cart_item_id": types.Schema(
+                type=types.Type.STRING,
+                description="Specific cart item UUID if known."
+            ),
+            "remove_all": types.Schema(
+                type=types.Type.BOOLEAN,
+                description="Set to true if user wants to clear or empty the entire cart."
+            ),
+        },
+        required=[],
+    ),
+)
+
 AGENT_TOOLS = types.Tool(function_declarations=[
     SEARCH_PRODUCTS_TOOL,
     GET_PRODUCT_TOOL,
     GET_CART_TOOL,
     ADD_TO_CART_TOOL,
+    REMOVE_FROM_CART_TOOL,
     CHECKOUT_SINGLE_PRODUCT_TOOL,
     CHECKOUT_CART_TOOL,
     CONFIRM_CHECKOUT_TOOL,
@@ -303,6 +337,35 @@ HF_AGENT_TOOLS = [
                         "maximum": 99,
                         "default": 1,
                         "description": "Quantity to add",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_from_cart",
+            "description": "Remove an item or all items from the customer's cart. Use when user says 'remove item #1', 'remove the shirt from my cart', 'empty my cart', etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_position": {
+                        "type": "integer",
+                        "description": "1-based position of the item in the cart (e.g. 1 for first item, 2 for second item).",
+                    },
+                    "product_name": {
+                        "type": "string",
+                        "description": "Name or keyword of the product to remove from cart (e.g. 'shirt', 'pants').",
+                    },
+                    "cart_item_id": {
+                        "type": "string",
+                        "description": "Specific cart item UUID if known.",
+                    },
+                    "remove_all": {
+                        "type": "boolean",
+                        "description": "True to remove all items and empty the cart.",
                     },
                 },
                 "required": [],
@@ -418,7 +481,12 @@ Core Rules:
 - Do not ask for product IDs — use search result positions
 - If a tool fails, explain the actual reason to the user
 - Do not mention internal implementation, embeddings, database queries, or system internals
-- If user asks unrelated questions, respond naturally without calling product tools
+===== SEARCH / BROWSE =====
+
+When the user is looking for, browsing, or asking about products (e.g., "show me shirts", "find black sneakers", "white formal shirts", "what products do you have?"):
+1. Call search_products with the user's search query.
+2. NEVER call add_to_cart, checkout_single_product, or checkout_cart during a search/browse query.
+3. ONLY call add_to_cart if the user explicitly asks to add an item to their cart.
 
 ===== ADD TO CART =====
 
@@ -430,6 +498,14 @@ For "add the second one to cart", "add first product", "add #1", "put the first 
    - Find the Large variant, call add_to_cart with specific variant_id
 4. If user specifies quantity "add 2 of the second one", use quantity=2. Default is 1.
 5. NEVER invent product_id values like "1" or "first" — positions are integers, IDs are UUIDs.
+
+===== REMOVE FROM CART =====
+
+When the user asks to remove an item or empty their cart:
+- "remove the first item", "remove item #1 from cart", "delete #2 from cart" → call remove_from_cart(item_position=<N>)
+- "remove the shirt from my cart", "remove black shoes from cart" → call remove_from_cart(product_name="<name>")
+- "empty my cart", "clear my cart", "remove everything from cart" → call remove_from_cart(remove_all=true)
+- After removing an item, inform the user which item was removed and current cart count.
 
 ===== PURCHASE / CHECKOUT — THREE DISTINCT MODES =====
 
@@ -1058,13 +1134,13 @@ class AgentService:
 
         if cart_to_summarize and cart_to_summarize.items:
             cart_descs = []
-            for item in cart_to_summarize.items:
+            for idx, item in enumerate(cart_to_summarize.items, 1):
                 variant = item.variant
                 product_title = variant.product.title if variant and variant.product else "Item"
                 color_info = f" {variant.color}" if variant and variant.color else ""
                 size_info = f" {variant.size}" if variant and variant.size else ""
-                cart_descs.append(f"{item.quantity}x {product_title}{color_info}{size_info} (price: {item.price_at_addition})")
-            parts.append(f"Customer Cart ({len(cart_to_summarize.items)} items):\n  " + "\n  ".join(cart_descs))
+                cart_descs.append(f"  [Cart Item #{idx}] {item.quantity}x {product_title}{color_info}{size_info} (price: ₹{item.price_at_addition}, item_id: {item.id})")
+            parts.append(f"Customer Cart ({len(cart_to_summarize.items)} items):\n" + "\n".join(cart_descs))
         elif cart_to_summarize:
             parts.append("Customer Cart: empty (0 items)")
 
@@ -1266,11 +1342,20 @@ User: {user_message}
 
 IMPORTANT ROUTING RULES (use context above for positions/IDs):
 
+SEARCH / BROWSE:
+- "show me shirts", "white shirts", "find black pants", "what do you have", "search shoes" → call ONLY search_products(query=...)
+- DO NOT call add_to_cart or checkout tools when user is searching or browsing products.
+
 ADD TO CART:
-- "add the first one", "add #1", "add second one", etc. → add_to_cart(reference_position=N)
+- "add the first one", "add #1", "add second one", "put #2 in my cart", etc. → add_to_cart(reference_position=N)
 - If user specifies variant (e.g. "in Large") → call get_product first, then add_to_cart with variant_id
 - Explicit UUID provided → call get_product, then add_to_cart with variant_id
 - NEVER use product_id="1" for "first product" — position is an integer, IDs are UUIDs
+
+REMOVE FROM CART:
+- "remove the first item", "remove item #1 from my cart", "delete #2" → call remove_from_cart(item_position=N)
+- "remove shirt from cart", "remove sneakers from my cart" → call remove_from_cart(product_name="...")
+- "empty cart", "clear my cart", "remove everything from cart" → call remove_from_cart(remove_all=true)
 
 PURCHASE / CHECKOUT:
 - "buy first product", "proceed payment of 1st product", "purchase the first one", "pay for 2nd item", "checkout the third one"
@@ -1291,8 +1376,8 @@ PURCHASE / CHECKOUT:
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
-        primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or os.getenv("GEMINI_INTENT_MODEL", "gemini-2.5-flash")
-        candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+        primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or os.getenv("GEMINI_INTENT_MODEL", "gemini-3.6-flash")
+        candidate_models = [primary_model, "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
         candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
         last_exc = None
@@ -1387,6 +1472,9 @@ PURCHASE / CHECKOUT:
         elif tool_name == "add_to_cart":
             return self._execute_add_to_cart(args, session)
 
+        elif tool_name == "remove_from_cart":
+            return self._execute_remove_from_cart(args, session)
+
         # New purchase-scope tools
         elif tool_name == "checkout_single_product":
             return self._execute_checkout_single_product(args, session)
@@ -1450,6 +1538,82 @@ PURCHASE / CHECKOUT:
             return {"success": False, "error": "Invalid ID format", "message": "Invalid UUID format."}
 
         return self.tool_add_to_cart(session, product_id, variant_id, quantity)
+
+    def _execute_remove_from_cart(self, args: Dict[str, Any], session: AgentSession) -> Dict[str, Any]:
+        """Execute remove_from_cart with support for position, name matching, ID, or clear all."""
+        cart = self._get_cart(session)
+        if not cart or not cart.items:
+            return {
+                "success": False,
+                "error": "Cart is empty",
+                "message": "Your cart is currently empty.",
+            }
+
+        remove_all = args.get("remove_all", False)
+        item_position = args.get("item_position")
+        item_id_str = args.get("cart_item_id") or args.get("item_id")
+        product_query = args.get("product_name") or args.get("query")
+
+        # 1. Clear entire cart
+        if remove_all or (product_query and str(product_query).lower() in ("all", "everything", "cart", "all items")):
+            count = len(cart.items)
+            for item in list(cart.items):
+                self.db.delete(item)
+            self.db.commit()
+            return {
+                "success": True,
+                "removed_count": count,
+                "message": f"Removed all {count} item(s) from your cart. Your cart is now empty.",
+            }
+
+        target_item = None
+
+        # 2. Match by direct cart item UUID
+        if item_id_str:
+            try:
+                target_uuid = uuid.UUID(str(item_id_str).strip())
+                target_item = next((i for i in cart.items if i.id == target_uuid), None)
+            except Exception:
+                pass
+
+        # 3. Match by 1-based position in cart
+        if not target_item and item_position is not None:
+            try:
+                pos = int(item_position) - 1
+                if 0 <= pos < len(cart.items):
+                    target_item = cart.items[pos]
+            except Exception:
+                pass
+
+        # 4. Match by product title / color keyword
+        if not target_item and product_query:
+            pq = str(product_query).lower().strip()
+            for item in cart.items:
+                title = (item.variant.product.title if item.variant and item.variant.product else "").lower()
+                color = (item.variant.color or "").lower() if item.variant else ""
+                if pq in title or pq in color or any(w in title for w in pq.split()):
+                    target_item = item
+                    break
+
+        if not target_item:
+            return {
+                "success": False,
+                "error": "Item not found",
+                "message": "Could not find that item in your cart to remove.",
+            }
+
+        removed_title = target_item.variant.product.title if target_item.variant and target_item.variant.product else "Item"
+        self.db.delete(target_item)
+        self.db.commit()
+
+        cart_info = self.tool_get_cart(session)
+
+        return {
+            "success": True,
+            "removed_item": removed_title,
+            "cart_summary": cart_info,
+            "message": f"Removed '{removed_title}' from your cart. You now have {cart_info.get('item_count', 0)} item(s) in your cart.",
+        }
 
     def _execute_checkout_single_product(
         self, args: Dict[str, Any], session: AgentSession
@@ -1904,11 +2068,11 @@ PURCHASE / CHECKOUT:
                 else:
                     summary_parts.append(f"Could not get cart: {res.get('message', 'Unknown error')}")
 
-            elif name == "add_to_cart":
+            elif name in ("add_to_cart", "remove_from_cart"):
                 if res.get("success"):
-                    summary_parts.append(res.get("message", "Added to cart."))
+                    summary_parts.append(res.get("message", "Cart updated."))
                 else:
-                    summary_parts.append(f"Could not add to cart: {res.get('message', 'Unknown error')}")
+                    summary_parts.append(f"Could not update cart: {res.get('message', 'Unknown error')}")
 
             elif name in ("checkout_single_product", "checkout_cart", "confirm_checkout"):
                 if res.get("message"):
@@ -1955,8 +2119,8 @@ Rules:
                     system_instruction=AGENT_SYSTEM_INSTRUCTION,
                     temperature=0.0,
                 )
-                primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-2.5-flash"
-                candidate_models = [primary_model, "gemini-2.5-flash", "gemini-flash-latest"]
+                primary_model = getattr(settings, "GEMINI_INTENT_MODEL", None) or "gemini-3.6-flash"
+                candidate_models = [primary_model, "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
                 candidate_models = [m for m in dict.fromkeys(candidate_models) if m]
 
                 for model_name in candidate_models:
@@ -2028,7 +2192,7 @@ Rules:
                         temperature=0.0,
                     )
                     followup_response = self.gemini_client.models.generate_content(
-                        model=getattr(settings, "GEMINI_INTENT_MODEL", "gemini-2.5-flash"),
+                        model=getattr(settings, "GEMINI_INTENT_MODEL", "gemini-3.6-flash"),
                         contents=prompt,
                         config=config,
                     )
@@ -2088,7 +2252,7 @@ Rules:
                     "warnings": res.get("warnings", []),
                 }
 
-            elif name == "add_to_cart" and res.get("success"):
+            elif name in ("add_to_cart", "remove_from_cart") and res.get("success"):
                 cart_updated = True
 
             elif name in ("checkout_single_product", "checkout_cart") and res.get("success"):
@@ -2116,6 +2280,17 @@ Rules:
                     "currency": res.get("currency"),
                     "key_id": res.get("key_id"),
                     "status": res.get("status"),
+                }
+
+        if cart_updated and cart_summary is None:
+            cart_res = self.tool_get_cart(session)
+            if cart_res.get("success"):
+                cart_summary = {
+                    "cart_id": cart_res.get("cart_id"),
+                    "items": cart_res.get("items", []),
+                    "subtotal": cart_res.get("subtotal"),
+                    "item_count": cart_res.get("item_count"),
+                    "warnings": cart_res.get("warnings", []),
                 }
 
         return AgentChatResponse(

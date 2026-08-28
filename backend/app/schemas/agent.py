@@ -70,6 +70,15 @@ class AgentToolAddToCartInput(BaseModel):
     quantity: int = Field(default=1, ge=1, le=99)
 
 
+class AgentToolRemoveFromCartInput(BaseModel):
+    """Input for remove_from_cart tool."""
+
+    item_position: Optional[int] = Field(None, ge=1, le=50, description="1-based position in customer's cart")
+    product_name: Optional[str] = Field(None, description="Product name or keyword to remove")
+    cart_item_id: Optional[str] = Field(None, description="Specific cart item UUID")
+    remove_all: Optional[bool] = Field(False, description="Whether to clear all items from cart")
+
+
 class AgentToolCheckoutSingleProductInput(BaseModel):
     """Input for checkout_single_product tool."""
     
